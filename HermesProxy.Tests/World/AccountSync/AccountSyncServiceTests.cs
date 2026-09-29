@@ -3,9 +3,11 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using HermesProxy.World;
@@ -76,6 +78,166 @@ public class AccountSyncServiceTests
 
         Assert.InRange(stopwatch.Elapsed, TimeSpan.FromSeconds(1.3), TimeSpan.FromSeconds(2.5));
         Assert.Equal(local, File.ReadAllBytes(Path.Combine(directory, "data-2.bin")));
+    }
+
+    [Fact]
+    public void ReconcileAtWorldEntry_BudgetExpiresAfterPayloadRead_DoesNotWriteLocally()
+    {
+        string directory = WithChangedLocalFile(123);
+        string file = Path.Combine(directory, "data-2.bin");
+        byte[] local = File.ReadAllBytes(file);
+        var journal = new AccountSyncJournal();
+        journal.Documents[Key] = new() { Revision = "r1", Sha256 = AccountSyncContainer.Sha256(local) };
+        journal.Save(Path.Combine(directory, "sync-journal.json"));
+        string remoteHash = AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData);
+        using var service = Service(new FakeHandler(request => request.RequestUri!.AbsolutePath switch
+        {
+            var p when p.EndsWith("/capabilities") => Json(HttpStatusCode.OK, Capabilities()),
+            var p when p.EndsWith("/documents") => Json(HttpStatusCode.OK, ListHead("r2", remoteHash)),
+            _ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new DelayedReadStream(
+                    Encoding.UTF8.GetBytes(Document("r2", remoteHash, AccountSyncContainerTests.RealData)),
+                    TimeSpan.FromMilliseconds(1600))),
+            },
+        }));
+
+        service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
+
+        Assert.Equal(local, File.ReadAllBytes(file));
+        Assert.False(Directory.Exists(Path.Combine(directory, "sync-backups")));
+        Assert.Equal("r1", AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json")).Documents[Key].Revision);
+    }
+
+    [Fact]
+    public void ReconcileAtWorldEntry_LocalChangesDuringPayloadRequest_AbortsCompareAndSwap()
+    {
+        string directory = WithChangedLocalFile(123);
+        string file = Path.Combine(directory, "data-2.bin");
+        byte[] original = File.ReadAllBytes(file);
+        byte[] newer = ChangedData(456);
+        var journal = new AccountSyncJournal();
+        journal.Documents[Key] = new() { Revision = "r1", Sha256 = AccountSyncContainer.Sha256(original) };
+        journal.Save(Path.Combine(directory, "sync-journal.json"));
+        string remoteHash = AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData);
+        using var service = Service(new FakeHandler(request =>
+        {
+            string path = request.RequestUri!.AbsolutePath;
+            if (path.EndsWith("/capabilities")) return Json(HttpStatusCode.OK, Capabilities());
+            if (path.EndsWith("/documents")) return Json(HttpStatusCode.OK, ListHead("r2", remoteHash));
+            File.WriteAllBytes(file, newer);
+            return Json(HttpStatusCode.OK, Document("r2", remoteHash, AccountSyncContainerTests.RealData));
+        }));
+
+        service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
+
+        Assert.Equal(newer, File.ReadAllBytes(file));
+        Assert.False(Directory.Exists(Path.Combine(directory, "sync-backups")));
+        Assert.Equal("r1", AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json")).Documents[Key].Revision);
+    }
+
+    [Fact]
+    public async Task Client_ResponseBodiesHaveEndpointSpecificHardCaps()
+    {
+        var declaredStream = new NonSeekableReadStream(Encoding.UTF8.GetBytes(Capabilities()));
+        var handler = new FakeHandler(request =>
+        {
+            string path = request.RequestUri!.AbsolutePath;
+            HttpContent content;
+            if (path.EndsWith("/capabilities"))
+            {
+                content = new StreamContent(declaredStream);
+                content.Headers.ContentLength = 64 * 1024 + 1;
+            }
+            else if (path.EndsWith("/documents") && request.Method == HttpMethod.Get)
+                content = new StreamContent(new NonSeekableReadStream(new byte[1024 * 1024 + 1]));
+            else if (request.Method == HttpMethod.Get)
+                content = new StreamContent(new NonSeekableReadStream(new byte[256 * 1024 + 1]));
+            else
+                content = new StreamContent(new NonSeekableReadStream(new byte[64 * 1024 + 1]));
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+        });
+        var client = new AccountSyncClient(Options(), new HttpClient(handler));
+        CancellationToken token = TestContext.Current.CancellationToken;
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => client.GetCapabilitiesAsync(token));
+        Assert.Equal(0, declaredStream.BytesRead);
+        await Assert.ThrowsAsync<InvalidDataException>(() => client.ListDocumentsAsync(token));
+        await Assert.ThrowsAsync<InvalidDataException>(() => client.GetDocumentAsync(Key, token));
+        await Assert.ThrowsAsync<InvalidDataException>(() => client.PutDocumentAsync(
+            Key, AccountSyncContainerTests.RealData, AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData), null, token));
+    }
+
+    [Fact]
+    public async Task Upload_TransientFailuresRetryWithBackoffThenStop()
+    {
+        string directory = WithLocalFile();
+        var clock = new FakeClock();
+        HttpStatusCode[] statuses =
+        [
+            HttpStatusCode.InternalServerError,
+            HttpStatusCode.TooManyRequests,
+            HttpStatusCode.ServiceUnavailable,
+            HttpStatusCode.BadGateway,
+        ];
+        int puts = 0;
+        var handler = new FakeHandler(request =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/capabilities")) return Json(HttpStatusCode.OK, Capabilities());
+            if (request.Method == HttpMethod.Get) return Json(HttpStatusCode.OK, EmptyList());
+            return new HttpResponseMessage(statuses[puts++]);
+        });
+        using var service = new AccountSyncService(Options(), new HttpClient(handler), clock);
+
+        await service.ReconcileUploadForTestAsync(directory, "Elwynn", Guid, 2, TestContext.Current.CancellationToken);
+        await WaitUntilAsync(() => clock.Delays.Count >= 1);
+        Assert.Equal(TimeSpan.FromSeconds(30), clock.Delays[0]);
+        clock.Advance(TimeSpan.FromSeconds(30));
+        await WaitUntilAsync(() => clock.Delays.Count >= 2);
+        Assert.Equal(TimeSpan.FromMinutes(2), clock.Delays[1]);
+        clock.Advance(TimeSpan.FromMinutes(2));
+        await WaitUntilAsync(() => clock.Delays.Count >= 3);
+        Assert.Equal(TimeSpan.FromMinutes(10), clock.Delays[2]);
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await WaitUntilAsync(() => Volatile.Read(ref puts) == 4);
+        clock.Advance(TimeSpan.FromDays(1));
+        await Task.Yield();
+
+        Assert.Equal(4, puts);
+        Assert.Equal(3, clock.Delays.Count);
+    }
+
+    [Fact]
+    public async Task Upload_NewerSaveReplacesPendingRetry()
+    {
+        string directory = WithLocalFile();
+        string file = Path.Combine(directory, "data-2.bin");
+        byte[] newer = ChangedData(789);
+        string newerHash = AccountSyncContainer.Sha256(newer);
+        var clock = new FakeClock();
+        int puts = 0;
+        var handler = new FakeHandler(async (request, _) =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/capabilities")) return Json(HttpStatusCode.OK, Capabilities());
+            if (request.Method == HttpMethod.Get) return Json(HttpStatusCode.OK, EmptyList());
+            puts++;
+            if (puts == 1) return new HttpResponseMessage(HttpStatusCode.InternalServerError);
+            string requestJson = await request.Content!.ReadAsStringAsync(TestContext.Current.CancellationToken);
+            string hash = JsonDocument.Parse(requestJson).RootElement.GetProperty("sha256").GetString()!;
+            return Json(HttpStatusCode.OK, Head("r2", hash));
+        });
+        using var service = new AccountSyncService(Options(), new HttpClient(handler), clock);
+
+        await service.ReconcileUploadForTestAsync(directory, "Elwynn", Guid, 2, TestContext.Current.CancellationToken);
+        await WaitUntilAsync(() => clock.Delays.Count >= 1);
+        File.WriteAllBytes(file, newer);
+        service.EnqueueSaved(directory, "Elwynn", Guid, 2);
+        await WaitUntilAsync(() => clock.Delays.Contains(TimeSpan.FromSeconds(5)));
+        clock.Advance(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json")).Documents.ContainsKey(Key));
+
+        Assert.Equal(newerHash, AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json")).Documents[Key].Sha256);
+        Assert.Equal(2, puts);
     }
 
     [Fact]
@@ -175,6 +337,27 @@ public class AccountSyncServiceTests
         return directory;
     }
 
+    private static string WithChangedLocalFile(long timestamp)
+    {
+        string directory = NewDirectory();
+        File.WriteAllBytes(Path.Combine(directory, "data-2.bin"), ChangedData(timestamp));
+        return directory;
+    }
+
+    private static byte[] ChangedData(long timestamp)
+    {
+        byte[] data = (byte[])AccountSyncContainerTests.RealData.Clone();
+        BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(16), timestamp);
+        return data;
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        for (int attempt = 0; attempt < 200 && !condition(); attempt++)
+            await Task.Delay(5, TestContext.Current.CancellationToken);
+        Assert.True(condition(), "condition was not reached");
+    }
+
     private static string NewDirectory()
     {
         string path = Path.Combine(Path.GetTempPath(), "jimsproxy-account-sync-tests", System.Guid.NewGuid().ToString("N"));
@@ -206,6 +389,92 @@ public class AccountSyncServiceTests
         {
             Requests.Add((request.Method, request.RequestUri!.AbsolutePath));
             return _respond(request, cancellationToken);
+        }
+    }
+
+    private class NonSeekableReadStream : Stream
+    {
+        private readonly byte[] _bytes;
+        private int _offset;
+
+        public NonSeekableReadStream(byte[] bytes) => _bytes = bytes;
+        public int BytesRead => _offset;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => _offset; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int read = Math.Min(count, _bytes.Length - _offset);
+            _bytes.AsSpan(_offset, read).CopyTo(buffer.AsSpan(offset, read));
+            _offset += read;
+            return read;
+        }
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int read = Math.Min(buffer.Length, _bytes.Length - _offset);
+            _bytes.AsMemory(_offset, read).CopyTo(buffer);
+            _offset += read;
+            return ValueTask.FromResult(read);
+        }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class DelayedReadStream : NonSeekableReadStream
+    {
+        private readonly TimeSpan _delay;
+        private bool _delayed;
+
+        public DelayedReadStream(byte[] bytes, TimeSpan delay) : base(bytes) => _delay = delay;
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (!_delayed)
+            {
+                _delayed = true;
+                await Task.Delay(_delay, CancellationToken.None);
+            }
+            return await base.ReadAsync(buffer, CancellationToken.None);
+        }
+    }
+
+    private sealed class FakeClock : IAccountSyncClock
+    {
+        private readonly object _gate = new();
+        private readonly List<(DateTimeOffset Due, TaskCompletionSource Completion)> _waiting = new();
+        private readonly List<TimeSpan> _delays = new();
+        private DateTimeOffset _now = DateTimeOffset.UnixEpoch;
+
+        public DateTimeOffset UtcNow { get { lock (_gate) return _now; } }
+        public IReadOnlyList<TimeSpan> Delays { get { lock (_gate) return _delays.ToArray(); } }
+
+        public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
+        {
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_gate)
+            {
+                _delays.Add(delay);
+                _waiting.Add((_now + delay, completion));
+            }
+            cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
+            return completion.Task;
+        }
+
+        public void Advance(TimeSpan duration)
+        {
+            List<TaskCompletionSource> ready;
+            lock (_gate)
+            {
+                _now += duration;
+                ready = _waiting.Where(item => item.Due <= _now).Select(item => item.Completion).ToList();
+                _waiting.RemoveAll(item => item.Due <= _now);
+            }
+            foreach (var completion in ready) completion.TrySetResult();
         }
     }
 }

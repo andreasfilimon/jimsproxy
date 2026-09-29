@@ -20,9 +20,9 @@ An invalid or missing required value disables sync. Startup prints one `account 
 
 ## Data flow
 
-At world entry, before `AccountDataManager.LoadAllData` reads disk, the proxy gets capabilities and the document list. It may restore a remote type 2 or type 3 whole-file payload, then the existing loader proceeds normally. The entire inline operation has a 1.5-second budget; failure or timeout falls back to local data and never prevents world entry. In `upload-only` mode, restore decisions become no-ops.
+At world entry, before `AccountDataManager.LoadAllData` reads disk, the proxy gets capabilities and the document list. It may restore a remote type 2 or type 3 whole-file payload, then the existing loader proceeds normally. The entire inline operation has a 1.5-second budget, including the restore's backup, temporary-file write, replacement, and journal save; the token is checked before every such local write. Failure or timeout falls back to local data and never prevents world entry. In `upload-only` mode, restore decisions become no-ops.
 
-After the client atomically saves a type 2 or type 3 file, the packet handler only enqueues it. One background worker debounces each document for five seconds, reads the final file, and reconciles it with a 10-second timeout per request. A save never waits for HTTP and sync exceptions never escape into the packet handler. Shutdown attempts to flush pending work for two seconds and then drops what remains.
+After the client atomically saves a type 2 or type 3 file, the packet handler only enqueues it. One background worker debounces each document for five seconds, reads the final file, and reconciles it with a 10-second timeout per request. Network errors, request timeouts, HTTP 429, and 5xx responses re-queue the same key after 30 seconds, 2 minutes, and 10 minutes; after the fourth failure it waits for the next save or world entry. A newer save of that key replaces a pending retry. A save never waits for HTTP and sync exceptions never escape into the packet handler. Shutdown attempts to flush pending work for two seconds and then drops what remains.
 
 Document keys are fixed:
 
@@ -56,7 +56,7 @@ The existing files remain byte-for-byte AccountData containers:
 
 `u64 guidLow, u64 guidHigh, i64 timestamp, u32 type, u32 uncompressedSize, i32 compressedSize, byte[compressedSize]`, little-endian, followed by zlib data.
 
-The proxy uploads and restores the whole file. Before restore it verifies the advertised SHA-256 and byte length, type, the type 3 GUID, compressed length, zlib stream, exact inflated length, 128 KiB whole-file limit, and 1 MiB inflated limit.
+The proxy uploads and restores the whole file. Before restore it verifies the advertised SHA-256 and byte length, type, the type 3 GUID, compressed length, zlib stream, exact inflated length, 128 KiB whole-file limit, and 1 MiB inflated limit. It also re-reads and hashes the local file before making a backup and again immediately before replacement. If either hash differs from the hash used for the reconciliation decision, the restore stops, keeps the concurrent local save, and leaves the journal unchanged.
 
 The feature can create these items beneath `AccountData/<ACCOUNT>/<Realm>/`:
 
@@ -64,11 +64,13 @@ The feature can create these items beneath `AccountData/<ACCOUNT>/<Realm>/`:
 - `sync-backups/<filename>.<unix-ms>.bak`: the previous local file before a restore. The newest ten backups per source filename are retained.
 - Short-lived `.tmp`/`.sync.tmp` files used for atomic replacement; successful or failed handled writes clean them up.
 
-A missing local file is never treated as deletion. Network errors, malformed responses, invalid payloads, 413, 429, and timeouts keep local data. A 401 or 403 disables sync for the rest of the process. No token, payload, hash, or document key is logged.
+A missing local file is never treated as deletion. Network errors, malformed or oversized responses, invalid payloads, 413, 429, and timeouts keep local data. A 401 or 403 disables sync for the rest of the process. HTTP 413 and other 4xx responses except 409/429 are not retried. No token, payload, hash, or document key is logged.
 
 ## Required server API
 
 All requests use `Authorization: Bearer <token>`, JSON bodies, and the configured base URL. If configured, the launcher version is sent as `X-Stonetavern-Launcher-Version`.
+
+Responses are requested with headers-first streaming and fully bounded before JSON parsing. A declared `Content-Length` above the limit is rejected without reading the body, and an unbounded/chunked stream is cut off when it crosses the same limit: document GET 256 KiB, document list 1 MiB, and capabilities/write responses 64 KiB.
 
 ### Capabilities and listing
 

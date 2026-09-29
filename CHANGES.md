@@ -24,14 +24,19 @@ complete list and could erase a player's legacy bindings.
 separate website API, restricted to types 2/3 and the Elwynn/Barrens realm allow-list. World entry
 reconciles and validates remote whole-file containers within 1.5 seconds; saves feed one five-second
 debounced background worker; journals and ten-deep restore backups are atomic/local; shutdown gets a
-two-second flush. Missing/invalid configuration is inert, failures are fail-open, 401/403 disables
+two-second flush. The budget now gates each restore write, restore uses a last-moment local-file
+compare-and-swap, response bodies are capped before JSON parsing (256 KiB document, 1 MiB list, 64 KiB
+other), and transient upload failures retry after 30 seconds, 2 minutes, and 10 minutes with newer saves
+replacing retries. Missing/invalid configuration is inert, failures are fail-open, 401/403 disables
 the feature for the process, and no binding data is forwarded to the legacy game server. Existing
 touch points are marked `ACCOUNT-SYNC`; `docs/ACCOUNT-SYNC.md` documents configuration, protocol,
 failure behavior, maintenance, and removal.
 
 **Verification:** `HermesProxy.Tests/World/AccountSync/` covers configuration, canonical keys, every
 decision-table row, real-container validation, journal persistence, restore/backup and checksum
-rejection, the world-entry budget, authorization shutdown, both 409 branches, and fully inert mode.
+rejection, the world-entry budget and local-write gates, restore compare-and-swap, bounded response
+bodies, transient retry/backoff and newer-save replacement, authorization shutdown, both 409 branches,
+and fully inert mode.
 See the implementing commit's report for exact focused/full-suite counts and placebo results.
 
 ## 2026-09-18 — SMSG_FEATURE_SYSTEM_STATUS: leave the RaceClassExpansionLevels list absent instead of sending an empty one (Linux client crash at world entry)

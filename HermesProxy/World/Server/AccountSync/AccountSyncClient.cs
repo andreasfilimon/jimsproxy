@@ -9,6 +9,9 @@ namespace HermesProxy.World.Server.AccountSync;
 /// <summary>HTTP client for the StoneTavern account-sync v1 API.</summary>
 public sealed class AccountSyncClient
 {
+    private const int DefaultResponseLimit = 64 * 1024;
+    private const int DocumentResponseLimit = 256 * 1024;
+    private const int ListResponseLimit = 1024 * 1024;
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(10);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly HttpClient _http;
@@ -27,7 +30,7 @@ public sealed class AccountSyncClient
         using var timeout = RequestToken(cancellationToken);
         using var response = await SendAsync(HttpMethod.Get, "capabilities", null, timeout.Token);
         if (!response.IsSuccessStatusCode) throw new AccountSyncHttpException(response.StatusCode);
-        return await response.Content.ReadFromJsonAsync<AccountSyncCapabilities>(JsonOptions, timeout.Token);
+        return await ReadBoundedJsonAsync<AccountSyncCapabilities>(response.Content, DefaultResponseLimit, timeout.Token);
     }
 
     /// <summary>Lists all document heads visible to the token.</summary>
@@ -36,7 +39,7 @@ public sealed class AccountSyncClient
         using var timeout = RequestToken(cancellationToken);
         using var response = await SendAsync(HttpMethod.Get, "documents", null, timeout.Token);
         if (!response.IsSuccessStatusCode) throw new AccountSyncHttpException(response.StatusCode);
-        return (await response.Content.ReadFromJsonAsync<AccountSyncDocumentList>(JsonOptions, timeout.Token))?.Documents;
+        return (await ReadBoundedJsonAsync<AccountSyncDocumentList>(response.Content, ListResponseLimit, timeout.Token))?.Documents;
     }
 
     /// <summary>Gets one document payload, returning null for 404.</summary>
@@ -46,7 +49,7 @@ public sealed class AccountSyncClient
         using var response = await SendAsync(HttpMethod.Get, $"documents/{key}", null, timeout.Token);
         if (response.StatusCode == HttpStatusCode.NotFound) return null;
         if (!response.IsSuccessStatusCode) throw new AccountSyncHttpException(response.StatusCode);
-        return await response.Content.ReadFromJsonAsync<AccountSyncDocument>(JsonOptions, timeout.Token);
+        return await ReadBoundedJsonAsync<AccountSyncDocument>(response.Content, DocumentResponseLimit, timeout.Token);
     }
 
     /// <summary>Creates or conditionally updates a document.</summary>
@@ -79,8 +82,29 @@ public sealed class AccountSyncClient
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
         AccountSyncDocumentHead? head = null;
         if (response.IsSuccessStatusCode)
-            head = await response.Content.ReadFromJsonAsync<AccountSyncDocumentHead>(JsonOptions, timeout.Token);
+            head = await ReadBoundedJsonAsync<AccountSyncDocumentHead>(response.Content, DefaultResponseLimit, timeout.Token);
         return new AccountSyncWriteResult(response.StatusCode, head);
+    }
+
+    private static async Task<T?> ReadBoundedJsonAsync<T>(HttpContent content, int limit, CancellationToken cancellationToken)
+    {
+        if (content.Headers.ContentLength is long length && length > limit)
+            throw new InvalidDataException($"account sync response exceeds {limit} bytes");
+
+        await using var source = await content.ReadAsStreamAsync(cancellationToken);
+        using var buffer = new MemoryStream(Math.Min(limit, (int)(content.Headers.ContentLength ?? 0)));
+        byte[] chunk = new byte[16 * 1024];
+        while (true)
+        {
+            int remaining = limit + 1 - (int)buffer.Length;
+            int read = await source.ReadAsync(chunk.AsMemory(0, Math.Min(chunk.Length, remaining)), cancellationToken);
+            if (read == 0) break;
+            buffer.Write(chunk, 0, read);
+            if (buffer.Length > limit)
+                throw new InvalidDataException($"account sync response exceeds {limit} bytes");
+        }
+
+        return JsonSerializer.Deserialize<T>(buffer.GetBuffer().AsSpan(0, (int)buffer.Length), JsonOptions);
     }
 
     private async Task<HttpResponseMessage> SendAsync(HttpMethod method, string path, HttpContent? content, CancellationToken cancellationToken)

@@ -32,18 +32,24 @@ public sealed class AccountSyncJournal
     }
 
     /// <summary>Atomically replaces the journal on disk.</summary>
-    public void Save(string path)
+    public void Save(string path) => SaveWithinBudget(path, CancellationToken.None);
+
+    /// <summary>Atomically replaces the journal on disk unless cancellation has been requested.</summary>
+    public void SaveWithinBudget(string path, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         string temp = path + ".tmp";
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             File.WriteAllBytes(temp, JsonSerializer.SerializeToUtf8Bytes(this, JsonOptions));
+            cancellationToken.ThrowIfCancellationRequested();
             File.Move(temp, path, true);
         }
         finally
         {
-            if (File.Exists(temp)) File.Delete(temp);
+            if (!cancellationToken.IsCancellationRequested && File.Exists(temp)) File.Delete(temp);
         }
     }
 }

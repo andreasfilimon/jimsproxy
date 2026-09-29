@@ -84,6 +84,27 @@ All requests use `Authorization: Bearer <token>`, JSON bodies, and the configure
 
 The server must enforce the same canonical keys and container limits. `clientUploadId` should be idempotent for the same content so a transport retry is safe.
 
+## Why restoring at world entry works (measured)
+
+On a local test server (2026-09-28, test account only) the 1.14.2 client took whatever `data-2.bin` the proxy
+served at world entry: a newer file replaced its bindings, and so did a file with an **older** timestamp. The client
+does not compare timestamps with its own state, so the proxy can simply put the file in place before
+`LoadAllData` reads it. Not yet measured: the same after a full client restart (only log out / log in within one
+client process), and the opposite direction with a 1.12-style full binding list.
+
+## End-to-end test against a real server
+
+`AccountSyncLiveServerTests` plays two PCs of one account against a running sync server. It is skipped unless
+`ST_SYNC_E2E_BASE` and `ST_SYNC_E2E_TOKEN` are set; the server must have sync `on` for that account and no documents
+for it yet. It covers: first upload from PC A, restore of the exact bytes on an empty PC B, a follow-up change from A
+restored on B (with backup), and two offline edits ending as a conflict that overwrites nobody. Use a test account on
+a local or staging server only.
+
+```sh
+ST_SYNC_E2E_BASE=http://127.0.0.1:3399/api/launcher/sync ST_SYNC_E2E_TOKEN=<token> \
+  dotnet test HermesProxy.Tests --filter "FullyQualifiedName~AccountSyncLiveServerTests"
+```
+
 ## Maintenance, tests, and removal
 
 All implementation files are under `HermesProxy/World/Server/AccountSync/`. Existing-file touch points are deliberately marked:

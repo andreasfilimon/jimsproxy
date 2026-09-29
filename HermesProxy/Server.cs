@@ -20,6 +20,7 @@ using BNetServer;
 using Framework;
 using HermesProxy.Configuration;
 using HermesProxy.World.Enums;
+using HermesProxy.World.Server.AccountSync;
 
 namespace HermesProxy;
 
@@ -101,6 +102,9 @@ partial class Server
         Log.DebugLogEnabled = Settings.DebugOutput;
         Log.Print(LogType.Debug, "Debug logging enabled");
         Log.SpanStatsEnabled = Settings.SpanStatsLog;
+
+        // ACCOUNT-SYNC: initialize the opt-in environment-only binding sync service.
+        AccountSyncRuntime.Initialize();
 
         if (!AesGcm.IsSupported)
         {
@@ -192,6 +196,9 @@ partial class Server
         Console.WriteLine($"(bnetSocketServer.IsListening: {bnetSocketServer.IsListening}");
         Console.WriteLine($"(realmSocketServer.IsListening: {realmSocketServer.IsListening}");
         Console.WriteLine($"(worldSocketServer.IsListening: {worldSocketServer.IsListening}");
+
+        // ACCOUNT-SYNC: flush pending binding uploads on a normal server stop.
+        AccountSyncRuntime.FlushForShutdown();
 
         // JimsProxy: emit session.end and flush JSONL
         Log.Event("session.end", null);

@@ -2,6 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Framework.Logging;
+using HermesProxy.World.Server.AccountSync;
 
 namespace HermesProxy;
 
@@ -125,6 +126,8 @@ internal static class ShutdownHooks
 
         try
         {
+            // ACCOUNT-SYNC: best-effort bounded flush before process teardown.
+            AccountSyncRuntime.FlushForShutdown();
             Log.Event(eventType, payload);
         }
         catch

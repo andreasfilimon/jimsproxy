@@ -13,6 +13,27 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-29 — Opt-in cross-device sync for 1.14.2 key bindings
+
+**Issue:** Classic 1.14.2 stores global and per-character bindings in AccountData types 2 and 3,
+which HermesProxy kept only in its local `AccountData` directory. Sending those partial 1.14 binding
+files through the legacy server's `account_data` would be unsafe because 1.12 treats the slot as a
+complete list and could erase a player's legacy bindings.
+
+**Change:** `HermesProxy/World/Server/AccountSync/` adds an environment-only, HTTPS sync client for a
+separate website API, restricted to types 2/3 and the Elwynn/Barrens realm allow-list. World entry
+reconciles and validates remote whole-file containers within 1.5 seconds; saves feed one five-second
+debounced background worker; journals and ten-deep restore backups are atomic/local; shutdown gets a
+two-second flush. Missing/invalid configuration is inert, failures are fail-open, 401/403 disables
+the feature for the process, and no binding data is forwarded to the legacy game server. Existing
+touch points are marked `ACCOUNT-SYNC`; `docs/ACCOUNT-SYNC.md` documents configuration, protocol,
+failure behavior, maintenance, and removal.
+
+**Verification:** `HermesProxy.Tests/World/AccountSync/` covers configuration, canonical keys, every
+decision-table row, real-container validation, journal persistence, restore/backup and checksum
+rejection, the world-entry budget, authorization shutdown, both 409 branches, and fully inert mode.
+See the implementing commit's report for exact focused/full-suite counts and placebo results.
+
 ## 2026-09-18 — SMSG_FEATURE_SYSTEM_STATUS: leave the RaceClassExpansionLevels list absent instead of sending an empty one (Linux client crash at world entry)
 
 **Issue:** a player on Linux reported the 1.14.2 client crashing at world entry on the proxy, 6 of 6

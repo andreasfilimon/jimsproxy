@@ -425,6 +425,8 @@ public class AccountDataManager
 
     public void LoadAllData(WowGuid128 guid)
     {
+        // ACCOUNT-SYNC: restore binding documents before the normal disk load.
+        AccountSync.AccountSyncRuntime.Service?.ReconcileAtWorldEntry(GetAccountDataDirectory(), _realmName, guid);
         Data = new AccountData[ModernVersion.GetAccountDataCount()];
 
         for (uint i = 0; i < ModernVersion.GetAccountDataCount(); i++)
@@ -500,6 +502,9 @@ public class AccountDataManager
             writer.Write(compressedData);
         }
         File.Move(tempPath, finalPath, overwrite: true);
+
+        // ACCOUNT-SYNC: queue binding uploads after the atomic local save.
+        AccountSync.AccountSyncRuntime.Service?.EnqueueSaved(GetAccountDataDirectory(), _realmName, guid, type);
     }
 
     public byte[] LoadCUFProfiles()

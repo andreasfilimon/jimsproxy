@@ -1,0 +1,103 @@
+# Opt-in account binding sync
+
+JimsProxy can synchronize the Classic 1.14.2 client's global and per-character key bindings through a separate HTTPS service. It never sends these documents to the legacy game server: 1.14 writes only deviations from its defaults, while 1.12 interprets the same legacy `account_data` slots as complete binding lists, so forwarding them could erase a 1.12 player's keys.
+
+The feature is opt-in. Without all three required environment variables, it makes no network calls and creates no sync journal or backup files; normal local `AccountData` behavior is unchanged.
+
+## Configuration
+
+Configure the process environment, not command-line arguments (arguments are visible in tools such as `ps`):
+
+| Variable | Required | Meaning |
+|---|---:|---|
+| `ST_SYNC_BASE` | yes | API base, for example `https://stonetavern.app/api/launcher/sync`. HTTPS is required except for `http://127.0.0.1` and `http://localhost`. |
+| `ST_SYNC_TOKEN` | yes | Bearer token. The current service issues it for 24 hours and binds it to the account password. It is never logged. |
+| `ST_SYNC_DEVICE_ID` | yes | Canonical lower-case UUID for this installation. |
+| `ST_SYNC_DEVICE_LABEL` | no | 1–40 printable ASCII characters. The default is `JimsProxy ` plus the OS name; it never uses the machine name. |
+| `ST_SYNC_LAUNCHER_VERSION` | no | Sent in `X-Stonetavern-Launcher-Version`. |
+
+An invalid or missing required value disables sync. Startup prints one `account sync: on/off (reason)` line without credentials, keys, hashes, GUIDs, or payloads. Only realms named `Elwynn` or `Barrens` (trimmed, case-insensitive) participate. Only AccountData types 2 and 3 participate; all other types are untouched.
+
+## Data flow
+
+At world entry, before `AccountDataManager.LoadAllData` reads disk, the proxy gets capabilities and the document list. It may restore a remote type 2 or type 3 whole-file payload, then the existing loader proceeds normally. The entire inline operation has a 1.5-second budget; failure or timeout falls back to local data and never prevents world entry. In `upload-only` mode, restore decisions become no-ops.
+
+After the client atomically saves a type 2 or type 3 file, the packet handler only enqueues it. One background worker debounces each document for five seconds, reads the final file, and reconciles it with a 10-second timeout per request. A save never waits for HTTP and sync exceptions never escape into the packet handler. Shutdown attempts to flush pending work for two seconds and then drops what remains.
+
+Document keys are fixed:
+
+- Type 2: `v1/classic-era-42597/bindings/account/<slug>/-/2`
+- Type 3: `v1/classic-era-42597/bindings/character/<slug>/<guid-low>-<guid-high>/3`
+
+The GUID values are unsigned decimal `WowGuid128.GetLowValue()` and `GetHighValue()`, matching the local filename.
+
+## Reconciliation table
+
+`L` is the SHA-256 of the local whole file (or none), `J` is the last-confirmed journal entry (or none), and `R` is the active server head (or none). “Newer” means a different revision id.
+
+| L | J | R | Action |
+|---|---|---|---|
+| none | any | none | Nothing |
+| none | any | present | Restore (nothing in `upload-only`) |
+| present | none | none | Upload with `If-None-Match: *` |
+| present | none | same hash | Adopt R into J |
+| present | none | other hash | POST local as conflict candidate; keep local |
+| = J | present | = J | Nothing |
+| = J | present | newer than J | Restore (nothing in `upload-only`) |
+| != J | present | = J | Upload with `If-Match: <J revision>` |
+| != J | present | newer, hash = L | Adopt R into J |
+| != J | present | newer, hash != L | POST local as conflict candidate; keep local |
+
+After a 409 response, the proxy re-lists the head. If its hash equals the uploaded bytes it adopts the head; otherwise it posts the bytes as a conflict candidate. A head in `conflict` state blocks restores and normal uploads until the launcher resolves it.
+
+## Local files and validation
+
+The existing files remain byte-for-byte AccountData containers:
+
+`u64 guidLow, u64 guidHigh, i64 timestamp, u32 type, u32 uncompressedSize, i32 compressedSize, byte[compressedSize]`, little-endian, followed by zlib data.
+
+The proxy uploads and restores the whole file. Before restore it verifies the advertised SHA-256 and byte length, type, the type 3 GUID, compressed length, zlib stream, exact inflated length, 128 KiB whole-file limit, and 1 MiB inflated limit.
+
+The feature can create these items beneath `AccountData/<ACCOUNT>/<Realm>/`:
+
+- `sync-journal.json`: schema v1, atomically replaced, recording revision and hash by document key. A corrupt or unknown-version journal is treated as absent.
+- `sync-backups/<filename>.<unix-ms>.bak`: the previous local file before a restore. The newest ten backups per source filename are retained.
+- Short-lived `.tmp`/`.sync.tmp` files used for atomic replacement; successful or failed handled writes clean them up.
+
+A missing local file is never treated as deletion. Network errors, malformed responses, invalid payloads, 413, 429, and timeouts keep local data. A 401 or 403 disables sync for the rest of the process. No token, payload, hash, or document key is logged.
+
+## Required server API
+
+All requests use `Authorization: Bearer <token>`, JSON bodies, and the configured base URL. If configured, the launcher version is sent as `X-Stonetavern-Launcher-Version`.
+
+### Capabilities and listing
+
+- `GET <base>/capabilities` returns `{ "mode": "off"|"upload-only"|"on", "families": { "bindings": true|false }, "apiVersion": 1, "limits": {...} }`. Bindings run only for API v1, an enabled bindings family, and a non-off mode.
+- `GET <base>/documents` returns `{ "documents": [{ "key", "activeRevision": "r12"|null, "sha256", "byteLength", "state": "active"|"conflict", "updatedAt", "conflictCandidates": [...] }] }`.
+- `GET <base>/documents/<key>` returns `{ "revision", "sha256", "payloadB64", "byteLength", "kind", ... }`, or 404. Canonical key slashes remain path separators; they are not percent-encoded.
+
+### Writes
+
+- `PUT <base>/documents/<key>` uses `If-Match: <revision>` or `If-None-Match: *` and body `{ "formatVersion": 1, "sha256", "payloadB64", "clientUploadId": "<new UUID>", "deviceId", "deviceLabel" }`.
+- `POST <base>/documents/<key>/conflict-candidates` uses the same body without a precondition.
+- Successful writes return 200 and a document head (optionally including `repeated`). A PUT conflict returns 409 with conflict details. The service may return 401, 403 `sync_disabled`, 413, 428, or 429; the proxy's behavior is described above.
+
+The server must enforce the same canonical keys and container limits. `clientUploadId` should be idempotent for the same content so a transport retry is safe.
+
+## Maintenance, tests, and removal
+
+All implementation files are under `HermesProxy/World/Server/AccountSync/`. Existing-file touch points are deliberately marked:
+
+```sh
+grep -rn "ACCOUNT-SYNC" HermesProxy
+```
+
+Run the focused tests with the xUnit v3 in-process runner:
+
+```sh
+dotnet run --project HermesProxy.Tests -- --filter-namespace HermesProxy.Tests.World.AccountSync
+```
+
+Run the complete suite with `dotnet test HermesProxy.Tests` in a normal environment. In restricted sandboxes where the VSTest socket cannot bind, use `dotnet run --project HermesProxy.Tests`.
+
+To disable the feature, remove any one required `ST_SYNC_*` variable and restart. To remove it from the fork, delete the `AccountSync` source and test folders, remove the marked startup/load/save/shutdown lines and their `using` directives, and delete this document and the corresponding changelog entry. Existing journals and backups are then inert and may be deleted separately.

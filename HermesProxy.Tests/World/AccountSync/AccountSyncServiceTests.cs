@@ -609,6 +609,9 @@ public class AccountSyncServiceTests
                 await Task.Run(() => Save(manager, Saved(500)), TestContext.Current.CancellationToken);
             Assert.True(AccountSyncDeferredSaves.IsPending(file) || File.Exists(file), "positive control: the first save was deferred or already applied");
             Save(manager, Saved(600));
+            // Right away, before the background thread runs: the older deferred save is gone and not read.
+            Assert.False(AccountSyncDeferredSaves.IsPending(file));
+            Assert.Equal(600, manager.LoadData(Guid, 2)!.Timestamp);
             await Task.Delay(AccountSyncDeferredSaves.RetryInterval * 3, TestContext.Current.CancellationToken);
             Assert.Equal(Saved(600), File.ReadAllBytes(file));
             Assert.False(AccountSyncDeferredSaves.IsPending(file));
@@ -620,23 +623,121 @@ public class AccountSyncServiceTests
         }
     }
 
+    /// <summary>Round 2 finding 4: after a crash the player's newest save is what the next world entry sees.</summary>
     [Fact]
-    public void DeferredSaves_LeftByADeadProcess_AreKeptInBackupsAndNeverApplied()
+    public void DeferredSaves_LeftByADeadProcess_ArePutInPlaceAndTheOldFileIsBackedUp()
     {
         string directory = NewDirectory();
         string file = Path.Combine(directory, "data-2.bin");
-        byte[] current = ChangedData(700);
-        byte[] leftover = ChangedData(300);
+        byte[] current = ChangedData(300);
+        byte[] leftover = ChangedData(700);
         File.WriteAllBytes(file, current);
         File.WriteAllBytes(AccountSyncDeferredSaves.PathFor(file), leftover);
 
-        AccountSyncDeferredSaves.ArchiveLeftovers(directory, DateTimeOffset.FromUnixTimeMilliseconds(1_727_000_000_000));
+        AccountSyncDeferredSaves.RecoverLeftovers(directory, DateTimeOffset.FromUnixTimeMilliseconds(1_727_000_000_000));
 
-        Assert.Equal(current, File.ReadAllBytes(file));
+        Assert.Equal(leftover, File.ReadAllBytes(file));
         Assert.False(File.Exists(AccountSyncDeferredSaves.PathFor(file)));
         string kept = Assert.Single(Directory.GetFiles(Path.Combine(directory, "sync-backups")));
-        Assert.Equal("data-2.bin.1727000000000.deferred.bak", Path.GetFileName(kept));
-        Assert.Equal(leftover, File.ReadAllBytes(kept));
+        Assert.Equal("data-2.bin.1727000000000.bak", Path.GetFileName(kept));
+        Assert.Equal(current, File.ReadAllBytes(kept));
+    }
+
+    /// <summary>Round 2 finding 1: a crash after the temp write but before its rename must not lose the save.</summary>
+    [Fact]
+    public void DeferredSaves_AWholeTempFileFromACrash_WinsOverAnOlderDeferredOne()
+    {
+        string directory = NewDirectory();
+        string file = Path.Combine(directory, "data-2.bin");
+        File.WriteAllBytes(file, ChangedData(100));
+        File.WriteAllBytes(AccountSyncDeferredSaves.PathFor(file), ChangedData(200));
+        File.WriteAllBytes(file + AccountSyncDeferredSaves.TempSuffix, ChangedData(300));
+
+        AccountSyncDeferredSaves.RecoverLeftovers(directory, DateTimeOffset.FromUnixTimeMilliseconds(1_727_000_000_000));
+
+        Assert.Equal(ChangedData(300), File.ReadAllBytes(file));
+        var kept = Directory.GetFiles(Path.Combine(directory, "sync-backups")).Select(File.ReadAllBytes).ToList();
+        Assert.Equal(2, kept.Count);
+        Assert.Contains(kept, k => k.SequenceEqual(ChangedData(100)));
+        Assert.Contains(kept, k => k.SequenceEqual(ChangedData(200)));
+        Assert.Empty(Directory.GetFiles(directory, "*.deferred*"));
+    }
+
+    [Fact]
+    public void DeferredSaves_ACutOffTempFile_IsKeptButNeverPutInPlace()
+    {
+        string directory = NewDirectory();
+        string file = Path.Combine(directory, "data-2.bin");
+        byte[] current = ChangedData(100);
+        File.WriteAllBytes(file, current);
+        byte[] cut = ChangedData(300)[..40];
+        File.WriteAllBytes(file + AccountSyncDeferredSaves.TempSuffix, cut);
+        Assert.False(AccountSyncDeferredSaves.IsWholeContainer(file + AccountSyncDeferredSaves.TempSuffix)); // positive control
+
+        AccountSyncDeferredSaves.RecoverLeftovers(directory, DateTimeOffset.FromUnixTimeMilliseconds(1_727_000_000_000));
+
+        Assert.Equal(current, File.ReadAllBytes(file));
+        Assert.Equal(cut, File.ReadAllBytes(Assert.Single(Directory.GetFiles(Path.Combine(directory, "sync-backups")))));
+    }
+
+    /// <summary>Round 2 finding 2: an older save that was held up before any lock wakes up after a newer one.</summary>
+    [Fact]
+    public async Task SaveData_AnOlderSaveThatWakesUpLate_NeverReplacesANewerOne()
+    {
+        var (manager, directory, accountDirectory) = NewManager();
+        string file = Path.Combine(directory, "data-2.bin");
+        using var olderSequenced = new ManualResetEventSlim();
+        using var releaseOlder = new ManualResetEventSlim();
+        AccountDataManager.SaveSequencedForTest = timestamp =>
+        {
+            if (timestamp != 100) return;
+            olderSequenced.Set();
+            releaseOlder.Wait(TimeSpan.FromSeconds(5));
+        };
+        try
+        {
+            var older = Task.Run(() => Save(manager, Saved(100)), TestContext.Current.CancellationToken);
+            Assert.True(olderSequenced.Wait(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+            Save(manager, Saved(200));
+            releaseOlder.Set();
+            await older;
+            Assert.Equal(Saved(200), File.ReadAllBytes(file));
+        }
+        finally
+        {
+            AccountDataManager.SaveSequencedForTest = null;
+            releaseOlder.Set();
+            if (Directory.Exists(accountDirectory)) Directory.Delete(accountDirectory, recursive: true);
+        }
+    }
+
+    /// <summary>Round 2 finding 3: with the file lock in hand, a busy gate must not hold a restore past its wait.</summary>
+    [Fact]
+    public async Task DirectoryLock_BusyGateAfterTheFileLock_GivesUpInTimeAndLetsTheFileGo()
+    {
+        string directory = NewDirectory();
+        object gate = AccountSyncDirectoryLock.For(directory);
+        using var gateHeld = new ManualResetEventSlim();
+        using var releaseGate = new ManualResetEventSlim();
+        var holder = new Thread(() => { lock (gate) { gateHeld.Set(); releaseGate.Wait(TimeSpan.FromSeconds(10)); } });
+        holder.Start();
+        try
+        {
+            Assert.True(gateHeld.Wait(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+            var clock = Stopwatch.StartNew();
+            await Task.Run(() =>
+            {
+                using var held = AccountSyncDirectoryLock.Enter(directory, TimeSpan.FromMilliseconds(300), gateWait: TimeSpan.FromMilliseconds(300));
+                Assert.False(held.HasFileLock);
+            }, TestContext.Current.CancellationToken);
+            Assert.True(clock.Elapsed < TimeSpan.FromSeconds(1), $"waited {clock.ElapsedMilliseconds} ms");
+            HoldLauncherLock(directory).Dispose(); // the file lock was let go
+        }
+        finally
+        {
+            releaseGate.Set();
+            holder.Join();
+        }
     }
 
     [Fact]

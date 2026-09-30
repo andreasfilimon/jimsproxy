@@ -43,14 +43,32 @@ public static class AccountSyncDirectoryLock
     /// cancelled, whichever comes first, WITHOUT holding the in-process gate (so no other writer of this
     /// process waits behind the poll), then takes the gate. The gate is always held on return;
     /// <see cref="Held.HasFileLock"/> says whether the file lock is too. Dispose on the same thread.</summary>
-    public static Held Enter(string directory, TimeSpan wait, CancellationToken token = default)
+    /// <remarks><paramref name="gateWait"/> bounds the wait for the gate as well (null = until free, for a
+    /// client save that must end up either written or deferred). When the gate is not free in time the file
+    /// lock is released again and the result holds nothing: <see cref="Held.HasFileLock"/> is false and the
+    /// caller must not write.</remarks>
+    public static Held Enter(string directory, TimeSpan wait, CancellationToken token = default, TimeSpan? gateWait = null)
     {
         string normalized = Normalize(directory);
         FileStream? file = TryOpen(Path.Combine(normalized, FileName), wait, token);
         object gate = For(normalized);
         try
         {
-            Monitor.Enter(gate);
+            if (gateWait is null)
+            {
+                Monitor.Enter(gate);
+            }
+            else
+            {
+                var clock = Stopwatch.StartNew();
+                bool entered;
+                while (!(entered = Monitor.TryEnter(gate, 25)) && clock.Elapsed < gateWait.Value && !token.IsCancellationRequested) { }
+                if (!entered)
+                {
+                    file?.Dispose();
+                    return new Held(null, null);
+                }
+            }
         }
         catch
         {
@@ -85,11 +103,11 @@ public static class AccountSyncDirectoryLock
     /// <summary>The gate and, when it was free in time, the lock file.</summary>
     public sealed class Held : IDisposable
     {
-        private readonly object _gate;
+        private readonly object? _gate;
         private FileStream? _file;
         private bool _disposed;
 
-        internal Held(object gate, FileStream? file)
+        internal Held(object? gate, FileStream? file)
         {
             _gate = gate;
             _file = file;
@@ -101,7 +119,7 @@ public static class AccountSyncDirectoryLock
         {
             if (_disposed) return;
             _disposed = true;
-            Monitor.Exit(_gate);
+            if (_gate != null) Monitor.Exit(_gate);
             _file?.Dispose();
             _file = null;
         }

@@ -190,7 +190,7 @@ public sealed class AccountSyncService : IDisposable
             token.ThrowIfCancellationRequested();
             File.WriteAllBytes(temp, payload);
             RestoreTempWrittenForTest?.Invoke();
-            using (var held = AccountSyncDirectoryLock.Enter(directory, RestoreLockWait, token))
+            using (var held = AccountSyncDirectoryLock.Enter(directory, RestoreLockWait, token, gateWait: RestoreLockWait))
             {
                 RestoreLockAcquiredForTest?.Invoke();
                 // The launcher is replacing this file right now: leave it, the next world entry decides again.

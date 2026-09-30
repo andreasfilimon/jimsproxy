@@ -30,10 +30,16 @@ dead process goes to `sync-backups` instead of being applied. Restore waits up t
 1.5 s world-entry budget. `DOTNET_SYSTEM_IO_DISABLEFILELOCKING` turns account sync off.
 `docs/ACCOUNT-SYNC.md` "Lock shared with the launcher" is the contract.
 
-**Verification:** `HermesProxy.Tests` AccountSync 70 green: the round-1 interleaving (launcher stalls past
-the wait, client saves, launcher moves, client save wins), supersede, leftover archived, restore stands
-down, gate free while polling, world entry inside its budget, a real second process (`flock(1)`), file
-name pinned, locking switch. Placebo: each removed guard turns its test red (14 probes).
+Review round 2 (Terra): saves are ordered by a sequence number taken before any wait (an older save
+that wakes up late never replaces a newer one); a save left by a crash (`.deferred`, or a whole
+`.deferred.tmp`) is put in place at the next world entry with the replaced file backed up, a cut-off
+temp file is kept, never used; the gate wait is bounded for restore, recovery and the worker.
+
+**Verification:** `HermesProxy.Tests` AccountSync 74 green, among them: launcher stalls past the wait,
+client saves, launcher moves, client save wins; an older save that wakes up late loses; crash leftovers
+recovered (whole temp beats older deferred, cut-off temp kept); busy gate after the file lock gives up
+in time; restore stands down while a save is deferred; world entry inside its budget; a real second
+process (`flock(1)`); file name pinned; locking switch. Placebo: each removed guard turns its test red.
 
 ## 2026-09-29 — Opt-in cross-device sync for 1.14.2 key bindings
 

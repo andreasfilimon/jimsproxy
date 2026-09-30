@@ -425,9 +425,9 @@ public class AccountDataManager
 
     public void LoadAllData(WowGuid128 guid)
     {
-        // ACCOUNT-SYNC: a deferred save left by a process that died goes to sync-backups (never applied
-        // blindly); then restore binding documents before the normal disk load.
-        AccountSync.AccountSyncDeferredSaves.ArchiveLeftovers(GetAccountDataDirectory(), DateTimeOffset.UtcNow);
+        // ACCOUNT-SYNC: a save a process that died could not write is put in place first (the file it
+        // replaces goes to sync-backups); then restore binding documents before the normal disk load.
+        AccountSync.AccountSyncDeferredSaves.RecoverLeftovers(GetAccountDataDirectory(), DateTimeOffset.UtcNow);
         AccountSync.AccountSyncRuntime.Service?.ReconcileAtWorldEntry(GetAccountDataDirectory(), _realmName, guid);
         Data = new AccountData[ModernVersion.GetAccountDataCount()];
 
@@ -480,6 +480,9 @@ public class AccountDataManager
         }
     }
 
+    /// <summary>Test hook: runs after a save took its sequence number and before it waits for any lock.</summary>
+    internal static Action<long>? SaveSequencedForTest;
+
     public void SaveData(WowGuid128 guid, long timestamp, uint type, uint uncompressedSize, byte[] compressedData)
     {
         if (compressedData == null)
@@ -495,6 +498,9 @@ public class AccountDataManager
 
         string finalPath = GetFullFileName(guid, type);
         string tempPath = finalPath + ".tmp";
+        // ACCOUNT-SYNC: taken before any wait, so an older save can never replace a newer one's bytes.
+        long sequence = AccountSync.AccountSyncDeferredSaves.NextSequence();
+        SaveSequencedForTest?.Invoke(timestamp);
         byte[] bytes = new byte[36 + compressedData.Length];
         using (var writer = new BinaryWriter(new MemoryStream(bytes)))
         {
@@ -516,15 +522,17 @@ public class AccountDataManager
             if (!held.HasFileLock)
             {
                 Log.Print(LogType.Warn, "account sync: the AccountData lock stayed busy, the save is written as soon as it frees");
-                AccountSync.AccountSyncDeferredSaves.Defer(finalPath, bytes,
+                AccountSync.AccountSyncDeferredSaves.Defer(finalPath, bytes, sequence,
                     () => AccountSync.AccountSyncRuntime.Service?.EnqueueSaved(directory, _realmName, guid, type));
                 return;
             }
+            if (!AccountSync.AccountSyncDeferredSaves.Claim(finalPath, sequence))
+                return; // a later save of this file is already written
             try
             {
                 File.WriteAllBytes(tempPath, bytes);
                 File.Move(tempPath, finalPath, overwrite: true);
-                AccountSync.AccountSyncDeferredSaves.Supersede(finalPath);
+                AccountSync.AccountSyncDeferredSaves.Supersede(finalPath, sequence);
             }
             finally
             {

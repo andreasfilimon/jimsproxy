@@ -34,8 +34,11 @@ public sealed class AccountSyncJournal
     /// <summary>Atomically replaces the journal on disk.</summary>
     public void Save(string path) => SaveWithinBudget(path, CancellationToken.None);
 
-    /// <summary>Atomically replaces the journal on disk unless cancellation has been requested.</summary>
-    public void SaveWithinBudget(string path, CancellationToken cancellationToken)
+    /// <summary>Starts each synchronous journal write only while the caller's budget remains active.</summary>
+    public void SaveWithinBudget(string path, CancellationToken cancellationToken) =>
+        SaveWithinBudget(path, cancellationToken, null);
+
+    internal void SaveWithinBudget(string path, CancellationToken cancellationToken, Action? afterTempWrite)
     {
         cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
@@ -44,12 +47,13 @@ public sealed class AccountSyncJournal
         {
             cancellationToken.ThrowIfCancellationRequested();
             File.WriteAllBytes(temp, JsonSerializer.SerializeToUtf8Bytes(this, JsonOptions));
+            afterTempWrite?.Invoke();
             cancellationToken.ThrowIfCancellationRequested();
             File.Move(temp, path, true);
         }
         finally
         {
-            if (!cancellationToken.IsCancellationRequested && File.Exists(temp)) File.Delete(temp);
+            if (File.Exists(temp)) File.Delete(temp);
         }
     }
 }

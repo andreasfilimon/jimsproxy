@@ -1,5 +1,6 @@
 using System;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -11,6 +12,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using HermesProxy.World;
+using HermesProxy.World.Server;
 using HermesProxy.World.Server.AccountSync;
 using Xunit;
 
@@ -137,6 +139,92 @@ public class AccountSyncServiceTests
     }
 
     [Fact]
+    public async Task Restore_SaveStartedWhileFinalLockIsHeld_WaitsThenWins()
+    {
+        string account = "sync-lock-test-" + System.Guid.NewGuid().ToString("N");
+        var manager = new AccountDataManager(account, "Elwynn") { Data = new AccountData[8] };
+        string directory = manager.GetAccountDataDirectory();
+        string accountDirectory = Directory.GetParent(directory)!.FullName;
+        string file = Path.Combine(directory, "data-2.bin");
+        byte[] local = ChangedData(123);
+        byte[] saved = ChangedData(789);
+        BinaryPrimitives.WriteUInt64LittleEndian(saved.AsSpan(0), Guid.GetLowValue());
+        BinaryPrimitives.WriteUInt64LittleEndian(saved.AsSpan(8), Guid.GetHighValue());
+        File.WriteAllBytes(file, local);
+        var journal = new AccountSyncJournal();
+        journal.Documents[Key] = new() { Revision = "r1", Sha256 = AccountSyncContainer.Sha256(local) };
+        journal.Save(Path.Combine(directory, "sync-journal.json"));
+        string remoteHash = AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData);
+        using var restoreHasLock = new ManualResetEventSlim();
+        using var allowRestore = new ManualResetEventSlim();
+        using var saveStarted = new ManualResetEventSlim();
+        using var service = Service(new FakeHandler(request => request.RequestUri!.AbsolutePath switch
+        {
+            var p when p.EndsWith("/capabilities") => Json(HttpStatusCode.OK, Capabilities()),
+            var p when p.EndsWith("/documents") => Json(HttpStatusCode.OK, ListHead("r2", remoteHash)),
+            _ => Json(HttpStatusCode.OK, Document("r2", remoteHash, AccountSyncContainerTests.RealData)),
+        }));
+        service.RestoreLockAcquiredForTest = () =>
+        {
+            restoreHasLock.Set();
+            allowRestore.Wait(TestContext.Current.CancellationToken);
+        };
+
+        try
+        {
+            Task restore = Task.Run(
+                () => service.ReconcileAtWorldEntry(directory, "Elwynn", Guid), TestContext.Current.CancellationToken);
+            Assert.True(restoreHasLock.Wait(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+            Task save = Task.Run(() =>
+            {
+                saveStarted.Set();
+                int compressedLength = BinaryPrimitives.ReadInt32LittleEndian(saved.AsSpan(32));
+                manager.SaveData(Guid, 789, 2,
+                    BinaryPrimitives.ReadUInt32LittleEndian(saved.AsSpan(28)), saved.AsSpan(36, compressedLength).ToArray());
+            }, TestContext.Current.CancellationToken);
+            Assert.True(saveStarted.Wait(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+            Assert.False(save.IsCompleted);
+
+            allowRestore.Set();
+            await Task.WhenAll(restore, save);
+
+            Assert.Equal(saved, File.ReadAllBytes(file));
+        }
+        finally
+        {
+            allowRestore.Set();
+            if (Directory.Exists(accountDirectory)) Directory.Delete(accountDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Restore_CancelledImmediatelyAfterTempWrite_DeletesTempFile()
+    {
+        string directory = WithChangedLocalFile(123);
+        string file = Path.Combine(directory, "data-2.bin");
+        byte[] local = File.ReadAllBytes(file);
+        var journal = new AccountSyncJournal();
+        journal.Documents[Key] = new() { Revision = "r1", Sha256 = AccountSyncContainer.Sha256(local) };
+        journal.Save(Path.Combine(directory, "sync-journal.json"));
+        string remoteHash = AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData);
+        using var cancellation = new CancellationTokenSource();
+        using var service = Service(new FakeHandler(request => request.RequestUri!.AbsolutePath switch
+        {
+            var p when p.EndsWith("/capabilities") => Json(HttpStatusCode.OK, Capabilities()),
+            var p when p.EndsWith("/documents") => Json(HttpStatusCode.OK, ListHead("r2", remoteHash)),
+            _ => Json(HttpStatusCode.OK, Document("r2", remoteHash, AccountSyncContainerTests.RealData)),
+        }));
+        service.RestoreTempWrittenForTest = cancellation.Cancel;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            service.ReconcileAtWorldEntryAsync(directory, "Elwynn", Guid, cancellation.Token));
+
+        Assert.False(File.Exists(file + ".sync.tmp"));
+        Assert.Equal(local, File.ReadAllBytes(file));
+    }
+
+    [Fact]
     public async Task Client_ResponseBodiesHaveEndpointSpecificHardCaps()
     {
         var declaredStream = new NonSeekableReadStream(Encoding.UTF8.GetBytes(Capabilities()));
@@ -165,7 +253,45 @@ public class AccountSyncServiceTests
         await Assert.ThrowsAsync<InvalidDataException>(() => client.ListDocumentsAsync(token));
         await Assert.ThrowsAsync<InvalidDataException>(() => client.GetDocumentAsync(Key, token));
         await Assert.ThrowsAsync<InvalidDataException>(() => client.PutDocumentAsync(
-            Key, AccountSyncContainerTests.RealData, AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData), null, token));
+            Key, AccountSyncContainerTests.RealData, AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData),
+            null, System.Guid.NewGuid().ToString("D"), token));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Upload_RetryReusesClientUploadId(bool conflictCandidate)
+    {
+        string directory = WithLocalFile();
+        var clock = new FakeClock();
+        var uploadIds = new ConcurrentQueue<string>();
+        var handler = new FakeHandler(async (request, token) =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/capabilities"))
+                return Json(HttpStatusCode.OK, Capabilities());
+            if (request.Method == HttpMethod.Get)
+                return Json(HttpStatusCode.OK, conflictCandidate
+                    ? ListHead("r1", new string('a', 64))
+                    : EmptyList());
+
+            string requestJson = await request.Content!.ReadAsStringAsync(token);
+            uploadIds.Enqueue(JsonDocument.Parse(requestJson).RootElement.GetProperty("clientUploadId").GetString()!);
+            return uploadIds.Count == 1
+                ? new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                : Json(HttpStatusCode.OK, Head("r2", AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData)));
+        });
+        using var service = new AccountSyncService(Options(), new HttpClient(handler), clock);
+
+        await service.ReconcileUploadForTestAsync(directory, "Elwynn", Guid, 2, TestContext.Current.CancellationToken);
+        await WaitUntilAsync(() => clock.Delays.Count >= 1);
+        clock.Advance(TimeSpan.FromSeconds(30));
+        await WaitUntilAsync(() => uploadIds.Count == 2);
+
+        string[] ids = uploadIds.ToArray();
+        Assert.Equal(ids[0], ids[1]);
+        Assert.All(ids, id => Assert.True(System.Guid.TryParseExact(id, "D", out _)));
+        Assert.All(handler.Requests.Where(x => x.Method is not null && x.Method != HttpMethod.Get),
+            request => Assert.Equal(conflictCandidate ? HttpMethod.Post : HttpMethod.Put, request.Method));
     }
 
     [Fact]
@@ -215,15 +341,18 @@ public class AccountSyncServiceTests
         byte[] newer = ChangedData(789);
         string newerHash = AccountSyncContainer.Sha256(newer);
         var clock = new FakeClock();
+        var uploadIds = new ConcurrentQueue<string>();
         int puts = 0;
         var handler = new FakeHandler(async (request, _) =>
         {
             if (request.RequestUri!.AbsolutePath.EndsWith("/capabilities")) return Json(HttpStatusCode.OK, Capabilities());
             if (request.Method == HttpMethod.Get) return Json(HttpStatusCode.OK, EmptyList());
+            string requestJson = await request.Content!.ReadAsStringAsync(TestContext.Current.CancellationToken);
+            using JsonDocument requestBody = JsonDocument.Parse(requestJson);
+            uploadIds.Enqueue(requestBody.RootElement.GetProperty("clientUploadId").GetString()!);
             puts++;
             if (puts == 1) return new HttpResponseMessage(HttpStatusCode.InternalServerError);
-            string requestJson = await request.Content!.ReadAsStringAsync(TestContext.Current.CancellationToken);
-            string hash = JsonDocument.Parse(requestJson).RootElement.GetProperty("sha256").GetString()!;
+            string hash = requestBody.RootElement.GetProperty("sha256").GetString()!;
             return Json(HttpStatusCode.OK, Head("r2", hash));
         });
         using var service = new AccountSyncService(Options(), new HttpClient(handler), clock);
@@ -238,6 +367,7 @@ public class AccountSyncServiceTests
 
         Assert.Equal(newerHash, AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json")).Documents[Key].Sha256);
         Assert.Equal(2, puts);
+        Assert.NotEqual(uploadIds.ElementAt(0), uploadIds.ElementAt(1));
     }
 
     [Fact]

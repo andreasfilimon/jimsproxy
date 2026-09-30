@@ -20,7 +20,7 @@ An invalid or missing required value disables sync. Startup prints one `account 
 
 ## Data flow
 
-At world entry, before `AccountDataManager.LoadAllData` reads disk, the proxy gets capabilities and the document list. It may restore a remote type 2 or type 3 whole-file payload, then the existing loader proceeds normally. The entire inline operation has a 1.5-second budget, including the restore's backup, temporary-file write, replacement, and journal save; the token is checked before every such local write. Failure or timeout falls back to local data and never prevents world entry. In `upload-only` mode, restore decisions become no-ops.
+At world entry, before `AccountDataManager.LoadAllData` reads disk, the proxy gets capabilities and the document list. It may restore a remote type 2 or type 3 whole-file payload, then the existing loader proceeds normally. The 1.5-second budget bounds the network part and gates the start of each subsequent local write. Those local writes are small (at most 128 KiB), synchronous file operations and cannot be interrupted after they start. Failure or timeout falls back to local data and never prevents world entry. In `upload-only` mode, restore decisions become no-ops.
 
 After the client atomically saves a type 2 or type 3 file, the packet handler only enqueues it. One background worker debounces each document for five seconds, reads the final file, and reconciles it with a 10-second timeout per request. Network errors, request timeouts, HTTP 429, and 5xx responses re-queue the same key after 30 seconds, 2 minutes, and 10 minutes; after the fourth failure it waits for the next save or world entry. A newer save of that key replaces a pending retry. A save never waits for HTTP and sync exceptions never escape into the packet handler. Shutdown attempts to flush pending work for two seconds and then drops what remains.
 
@@ -48,7 +48,7 @@ The GUID values are unsigned decimal `WowGuid128.GetLowValue()` and `GetHighValu
 | != J | present | newer, hash = L | Adopt R into J |
 | != J | present | newer, hash != L | POST local as conflict candidate; keep local |
 
-After a 409 response, the proxy re-lists the head. If its hash equals the uploaded bytes it adopts the head; otherwise it posts the bytes as a conflict candidate. A head in `conflict` state blocks restores and normal uploads until the launcher resolves it.
+After a 409 response, the proxy re-lists the head. If its hash equals the uploaded bytes it adopts the head; otherwise it posts the bytes as a conflict candidate. A head in `conflict` state blocks restores and normal uploads until the launcher resolves it. Each queued upload gets one `clientUploadId`; PUT and conflict-candidate retries for those bytes reuse it, while a newer save gets a new id.
 
 ## Local files and validation
 
@@ -56,13 +56,13 @@ The existing files remain byte-for-byte AccountData containers:
 
 `u64 guidLow, u64 guidHigh, i64 timestamp, u32 type, u32 uncompressedSize, i32 compressedSize, byte[compressedSize]`, little-endian, followed by zlib data.
 
-The proxy uploads and restores the whole file. Before restore it verifies the advertised SHA-256 and byte length, type, the type 3 GUID, compressed length, zlib stream, exact inflated length, 128 KiB whole-file limit, and 1 MiB inflated limit. It also re-reads and hashes the local file before making a backup and again immediately before replacement. If either hash differs from the hash used for the reconciliation decision, the restore stops, keeps the concurrent local save, and leaves the journal unchanged.
+The proxy uploads and restores the whole file. Before restore it verifies the advertised SHA-256 and byte length, type, the type 3 GUID, compressed length, zlib stream, exact inflated length, 128 KiB whole-file limit, and 1 MiB inflated limit. Save and restore share one process-wide synchronous lock per AccountData directory. Under that lock, restore re-reads and hashes the local file, makes the backup, and replaces the file; a save that arrives during this final section waits and writes its newer bytes afterward. If the hash differs from the one used for the reconciliation decision, restore stops, keeps the concurrent local save, and leaves the journal unchanged.
 
 The feature can create these items beneath `AccountData/<ACCOUNT>/<Realm>/`:
 
 - `sync-journal.json`: schema v1, atomically replaced, recording revision and hash by document key. A corrupt or unknown-version journal is treated as absent.
 - `sync-backups/<filename>.<unix-ms>.bak`: the previous local file before a restore. The newest ten backups per source filename are retained.
-- Short-lived `.tmp`/`.sync.tmp` files used for atomic replacement; successful or failed handled writes clean them up.
+- Short-lived `.tmp`/`.sync.tmp` files used for atomic replacement; successful, failed, and budget-cancelled writes clean them up.
 
 A missing local file is never treated as deletion. Network errors, malformed or oversized responses, invalid payloads, 413, 429, and timeouts keep local data. A 401 or 403 disables sync for the rest of the process. HTTP 413 and other 4xx responses except 409/429 are not retried. No token, payload, hash, or document key is logged.
 
@@ -80,11 +80,11 @@ Responses are requested with headers-first streaming and fully bounded before JS
 
 ### Writes
 
-- `PUT <base>/documents/<key>` uses `If-Match: <revision>` or `If-None-Match: *` and body `{ "formatVersion": 1, "sha256", "payloadB64", "clientUploadId": "<new UUID>", "deviceId", "deviceLabel" }`.
+- `PUT <base>/documents/<key>` uses `If-Match: <revision>` or `If-None-Match: *` and body `{ "formatVersion": 1, "sha256", "payloadB64", "clientUploadId": "<UUID stable across retries>", "deviceId", "deviceLabel" }`.
 - `POST <base>/documents/<key>/conflict-candidates` uses the same body without a precondition.
 - Successful writes return 200 and a document head (optionally including `repeated`). A PUT conflict returns 409 with conflict details. The service may return 401, 403 `sync_disabled`, 413, 428, or 429; the proxy's behavior is described above.
 
-The server must enforce the same canonical keys and container limits. `clientUploadId` should be idempotent for the same content so a transport retry is safe.
+The server must enforce the same canonical keys and container limits. It should treat `clientUploadId` idempotently so a retry after the server persisted a write but lost the response is safe.
 
 ## Why restoring at world entry works (measured)
 

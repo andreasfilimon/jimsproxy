@@ -32,6 +32,9 @@ public sealed class AccountSyncService : IDisposable
     private int _disabled;
     private int _shutdown;
 
+    internal Action? RestoreTempWrittenForTest { get; set; }
+    internal Action? RestoreLockAcquiredForTest { get; set; }
+
     /// <summary>Creates a service. The supplied HttpClient is reused for every request.</summary>
     public AccountSyncService(AccountSyncOptions options, HttpClient http, IAccountSyncClock? clock = null)
         : this(options, http, clock, ownsHttp: false) { }
@@ -52,7 +55,7 @@ public sealed class AccountSyncService : IDisposable
     /// <summary>True while configured and not process-disabled by authorization failure.</summary>
     public bool IsEnabled => _options.Enabled && Volatile.Read(ref _disabled) == 0;
 
-    /// <summary>Reconciles types 2 and 3 within one shared 1.5 second world-entry budget.</summary>
+    /// <summary>Reconciles types 2 and 3 with one shared 1.5 second network budget and local-write start gate.</summary>
     public void ReconcileAtWorldEntry(string directory, string realmName, WowGuid128 guid)
     {
         if (!IsEnabled || AccountSyncKeys.Build(realmName, guid, 2) == null) return;
@@ -78,7 +81,7 @@ public sealed class AccountSyncService : IDisposable
         if (!IsEnabled) return;
         string? key = AccountSyncKeys.Build(realmName, guid, type);
         if (key == null) return;
-        Queue(new PendingUpload(directory, realmName, guid, type, key, _clock.UtcNow + Debounce, 0));
+        Queue(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow + Debounce));
     }
 
     /// <summary>Flushes currently pending uploads within the caller's total budget.</summary>
@@ -112,10 +115,10 @@ public sealed class AccountSyncService : IDisposable
     {
         string? key = AccountSyncKeys.Build(realmName, guid, type);
         if (!IsEnabled || key == null) return;
-        await ReconcileUploadAsync(new PendingUpload(directory, realmName, guid, type, key, _clock.UtcNow, 0), cancellationToken);
+        await ReconcileUploadAsync(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow), cancellationToken);
     }
 
-    private async Task ReconcileAtWorldEntryAsync(string directory, string realmName, WowGuid128 guid, CancellationToken token)
+    internal async Task ReconcileAtWorldEntryAsync(string directory, string realmName, WowGuid128 guid, CancellationToken token)
     {
         var gate = _directoryLocks.GetOrAdd(directory, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(token);
@@ -151,7 +154,7 @@ public sealed class AccountSyncService : IDisposable
                     case AccountSyncAction.UploadCreate:
                     case AccountSyncAction.UploadMatch:
                     case AccountSyncAction.ConflictCandidate:
-                        Queue(new PendingUpload(directory, realmName, guid, type, key, _clock.UtcNow, 0));
+                        Queue(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow));
                         break;
                     case AccountSyncAction.ConflictBlocked:
                         Log.Print(LogType.Warn, "account sync: remote binding conflict awaits launcher resolution");
@@ -178,26 +181,26 @@ public sealed class AccountSyncService : IDisposable
             !AccountSyncContainer.Validate(payload, type, guid))
             throw new InvalidDataException("invalid remote payload");
 
-        token.ThrowIfCancellationRequested();
-        if (!await LocalMatchesAsync(file, expectedLocalHash, token)) return;
-        if (expectedLocalHash != null)
-        {
-            token.ThrowIfCancellationRequested();
-            Backup(file, directory, token);
-        }
         string temp = file + ".sync.tmp";
         try
         {
             token.ThrowIfCancellationRequested();
-            await File.WriteAllBytesAsync(temp, payload, token);
-            token.ThrowIfCancellationRequested();
-            if (!await LocalMatchesAsync(file, expectedLocalHash, token)) return;
-            token.ThrowIfCancellationRequested();
-            File.Move(temp, file, true);
+            File.WriteAllBytes(temp, payload);
+            RestoreTempWrittenForTest?.Invoke();
+            lock (AccountSyncDirectoryLock.For(directory))
+            {
+                RestoreLockAcquiredForTest?.Invoke();
+                token.ThrowIfCancellationRequested();
+                if (!LocalMatches(file, expectedLocalHash)) return;
+                if (expectedLocalHash != null)
+                    Backup(file, directory, token);
+                token.ThrowIfCancellationRequested();
+                File.Move(temp, file, true);
+            }
         }
         finally
         {
-            if (!token.IsCancellationRequested && File.Exists(temp)) File.Delete(temp);
+            if (File.Exists(temp)) File.Delete(temp);
         }
         token.ThrowIfCancellationRequested();
         journal.Documents[key] = new() { Revision = remote.Revision, Sha256 = remote.Sha256 };
@@ -220,12 +223,11 @@ public sealed class AccountSyncService : IDisposable
         }
     }
 
-    private static async Task<bool> LocalMatchesAsync(string file, string? expectedHash, CancellationToken token)
+    private static bool LocalMatches(string file, string? expectedHash)
     {
-        token.ThrowIfCancellationRequested();
         try
         {
-            byte[] current = await File.ReadAllBytesAsync(file, token);
+            byte[] current = File.ReadAllBytes(file);
             return string.Equals(AccountSyncContainer.Sha256(current), expectedHash, StringComparison.OrdinalIgnoreCase);
         }
         catch (FileNotFoundException)
@@ -270,13 +272,15 @@ public sealed class AccountSyncService : IDisposable
                 return;
             if (action == AccountSyncAction.ConflictCandidate)
             {
-                var conflictResult = await _client.PostConflictCandidateAsync(pending.Key, payload, hash, outerToken);
+                var conflictResult = await _client.PostConflictCandidateAsync(
+                    pending.Key, payload, hash, pending.ClientUploadId, outerToken);
                 HandleUploadStatus(pending, conflictResult.StatusCode);
                 return;
             }
 
             string? precondition = action == AccountSyncAction.UploadMatch ? journalEntry!.Revision : null;
-            var result = await _client.PutDocumentAsync(pending.Key, payload, hash, precondition, outerToken);
+            var result = await _client.PutDocumentAsync(
+                pending.Key, payload, hash, precondition, pending.ClientUploadId, outerToken);
             if (result.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
             {
                 DisableForProcess();
@@ -317,7 +321,8 @@ public sealed class AccountSyncService : IDisposable
             Adopt(journal, journalPath, pending.Key, head, hash, token);
             return;
         }
-        var result = await _client.PostConflictCandidateAsync(pending.Key, payload, hash, token);
+        var result = await _client.PostConflictCandidateAsync(
+            pending.Key, payload, hash, pending.ClientUploadId, token);
         HandleUploadStatus(pending, result.StatusCode);
     }
 
@@ -335,6 +340,10 @@ public sealed class AccountSyncService : IDisposable
         _pending[identity] = pending;
         _signals.Writer.TryWrite(identity);
     }
+
+    private static PendingUpload NewPendingUpload(string directory, string realmName, WowGuid128 guid, uint type,
+        string key, DateTimeOffset due) => new(
+        directory, realmName, guid, type, key, due, 0, System.Guid.NewGuid().ToString("D"));
 
     private void QueueRetry(PendingUpload pending)
     {
@@ -418,5 +427,5 @@ public sealed class AccountSyncService : IDisposable
     }
 
     private sealed record PendingUpload(string Directory, string RealmName, WowGuid128 Guid, uint Type, string Key,
-        DateTimeOffset Due, int RetryAttempt);
+        DateTimeOffset Due, int RetryAttempt, string ClientUploadId);
 }

@@ -54,21 +54,23 @@ public sealed class AccountSyncClient
 
     /// <summary>Creates or conditionally updates a document.</summary>
     public Task<AccountSyncWriteResult> PutDocumentAsync(string key, byte[] payload, string hash, string? revision,
-        CancellationToken cancellationToken) => WriteAsync(HttpMethod.Put, $"documents/{key}", payload, hash, revision, cancellationToken);
+        string clientUploadId, CancellationToken cancellationToken) =>
+        WriteAsync(HttpMethod.Put, $"documents/{key}", payload, hash, revision, clientUploadId, cancellationToken);
 
     /// <summary>Posts local content as a conflict candidate.</summary>
     public Task<AccountSyncWriteResult> PostConflictCandidateAsync(string key, byte[] payload, string hash,
-        CancellationToken cancellationToken) => WriteAsync(HttpMethod.Post, $"documents/{key}/conflict-candidates", payload, hash, null, cancellationToken);
+        string clientUploadId, CancellationToken cancellationToken) =>
+        WriteAsync(HttpMethod.Post, $"documents/{key}/conflict-candidates", payload, hash, null, clientUploadId, cancellationToken);
 
     private async Task<AccountSyncWriteResult> WriteAsync(HttpMethod method, string path, byte[] payload, string hash,
-        string? revision, CancellationToken cancellationToken)
+        string? revision, string clientUploadId, CancellationToken cancellationToken)
     {
         using var timeout = RequestToken(cancellationToken);
         var body = new AccountSyncUpload
         {
             Sha256 = hash,
             PayloadB64 = Convert.ToBase64String(payload),
-            ClientUploadId = Guid.NewGuid().ToString("D"),
+            ClientUploadId = clientUploadId,
             DeviceId = _options.DeviceId,
             DeviceLabel = _options.DeviceLabel,
         };

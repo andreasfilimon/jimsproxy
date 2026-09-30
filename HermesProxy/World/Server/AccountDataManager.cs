@@ -491,17 +491,28 @@ public class AccountDataManager
         string finalPath = GetFullFileName(guid, type);
         string tempPath = finalPath + ".tmp";
 
-        using (BinaryWriter writer = new BinaryWriter(File.Open(tempPath, FileMode.Create)))
+        // ACCOUNT-SYNC: serialize local saves with a restore's final compare-and-swap.
+        lock (AccountSync.AccountSyncDirectoryLock.For(Path.GetDirectoryName(finalPath)!))
         {
-            writer.Write(guid.GetLowValue());
-            writer.Write(guid.GetHighValue());
-            writer.Write(timestamp);
-            writer.Write(type);
-            writer.Write(uncompressedSize);
-            writer.Write(compressedData.Length);
-            writer.Write(compressedData);
+            try
+            {
+                using (BinaryWriter writer = new BinaryWriter(File.Open(tempPath, FileMode.Create)))
+                {
+                    writer.Write(guid.GetLowValue());
+                    writer.Write(guid.GetHighValue());
+                    writer.Write(timestamp);
+                    writer.Write(type);
+                    writer.Write(uncompressedSize);
+                    writer.Write(compressedData.Length);
+                    writer.Write(compressedData);
+                }
+                File.Move(tempPath, finalPath, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+            }
         }
-        File.Move(tempPath, finalPath, overwrite: true);
 
         // ACCOUNT-SYNC: queue binding uploads after the atomic local save.
         AccountSync.AccountSyncRuntime.Service?.EnqueueSaved(GetAccountDataDirectory(), _realmName, guid, type);

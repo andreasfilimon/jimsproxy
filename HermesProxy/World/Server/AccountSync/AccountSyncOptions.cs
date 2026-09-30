@@ -36,6 +36,9 @@ public sealed record AccountSyncOptions
             return Off("ST_SYNC_DEVICE_ID is missing");
         if (!Uri.TryCreate(rawBase.Trim(), UriKind.Absolute, out var baseUri) || !IsAllowedBase(baseUri))
             return Off("ST_SYNC_BASE is invalid");
+        // Without file locks the lock shared with the launcher excludes nobody (docs/ACCOUNT-SYNC.md).
+        if (AccountSyncDirectoryLock.FileLockingDisabled || IsTrue(read("DOTNET_SYSTEM_IO_DISABLEFILELOCKING")))
+            return Off("file locking is disabled for this process");
 
         string deviceId = rawDeviceId.Trim();
         if (!Guid.TryParseExact(deviceId, "D", out var parsedId) || deviceId != parsedId.ToString("D"))
@@ -77,5 +80,8 @@ public sealed record AccountSyncOptions
     }
 
     private static string? NullIfEmpty(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+    private static bool IsTrue(string? value) =>
+        value != null && (value.Trim() == "1" || value.Trim().Equals("true", StringComparison.OrdinalIgnoreCase));
+
     private static AccountSyncOptions Off(string reason) => new() { StatusReason = reason };
 }

@@ -20,5 +20,11 @@ public static class AccountSyncRuntime
     }
 
     /// <summary>Best-effort two-second shutdown flush.</summary>
-    public static void FlushForShutdown() => Service?.Shutdown(TimeSpan.FromSeconds(2));
+    public static void FlushForShutdown()
+    {
+        // Deferred saves first: they are the player's own changes and do not depend on sync being on.
+        if (AccountSyncDeferredSaves.ApplyPending(TimeSpan.FromSeconds(1)) > 0)
+            Log.Print(LogType.Warn, "account sync: a save is still waiting for the AccountData lock; it is kept in sync-backups at the next start");
+        Service?.Shutdown(TimeSpan.FromSeconds(2));
+    }
 }

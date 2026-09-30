@@ -503,7 +503,7 @@ public class AccountSyncServiceTests
         using (HoldLauncherLock(directory))
             service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
 
-        Assert.True(clock.Elapsed < TimeSpan.FromMilliseconds(1850), $"world entry waited {clock.ElapsedMilliseconds} ms");
+        Assert.True(clock.Elapsed < TimeSpan.FromMilliseconds(1650), $"world entry waited {clock.ElapsedMilliseconds} ms (budget 1500 ms)");
         Assert.Equal(local, File.ReadAllBytes(Path.Combine(directory, "data-2.bin")));
     }
 
@@ -543,31 +543,150 @@ public class AccountSyncServiceTests
         }
     }
 
-    [Fact]
-    public async Task SaveData_LauncherNeverLetsGo_StillSavesSoNoKeyIsLost()
+    private static (AccountDataManager Manager, string Directory, string AccountDirectory) NewManager()
     {
         string account = "sync-lock-test-" + System.Guid.NewGuid().ToString("N");
         var manager = new AccountDataManager(account, "Elwynn") { Data = new AccountData[8] };
         string directory = manager.GetAccountDataDirectory();
-        string accountDirectory = Directory.GetParent(directory)!.FullName;
-        byte[] saved = ChangedData(789);
-        int compressedLength = BinaryPrimitives.ReadInt32LittleEndian(saved.AsSpan(32));
+        return (manager, directory, Directory.GetParent(directory)!.FullName);
+    }
+
+    /// <summary>What SaveData writes for this GUID: the container with the GUID in its header.</summary>
+    private static byte[] Saved(long timestamp)
+    {
+        byte[] data = ChangedData(timestamp);
+        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(0), Guid.GetLowValue());
+        BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(8), Guid.GetHighValue());
+        return data;
+    }
+
+    private static void Save(AccountDataManager manager, byte[] container)
+    {
+        int compressedLength = BinaryPrimitives.ReadInt32LittleEndian(container.AsSpan(32));
+        manager.SaveData(Guid, BinaryPrimitives.ReadInt64LittleEndian(container.AsSpan(16)), 2,
+            BinaryPrimitives.ReadUInt32LittleEndian(container.AsSpan(28)), container.AsSpan(36, compressedLength).ToArray());
+    }
+
+    /// <summary>Round 1 finding: the launcher holds the lock past the proxy's wait (it stalled before its move),
+    /// the client saves meanwhile, then the launcher writes its older bytes. The client's save must win.</summary>
+    [Fact]
+    public async Task SaveData_LauncherStallsPastTheWait_TheClientSaveStillWinsAfterTheLaunchersMove()
+    {
+        var (manager, directory, accountDirectory) = NewManager();
+        string file = Path.Combine(directory, "data-2.bin");
+        byte[] launcherBytes = ChangedData(111);
+        byte[] clientSave = Saved(999);
         try
         {
-            using (HoldLauncherLock(directory))
+            using (var launcher = HoldLauncherLock(directory))
             {
                 var clock = Stopwatch.StartNew();
-                await Task.Run(() => manager.SaveData(Guid, 789, 2,
-                    BinaryPrimitives.ReadUInt32LittleEndian(saved.AsSpan(28)), saved.AsSpan(36, compressedLength).ToArray()),
-                    TestContext.Current.CancellationToken);
+                await Task.Run(() => Save(manager, clientSave), TestContext.Current.CancellationToken);
                 Assert.True(clock.Elapsed >= AccountSyncDirectoryLock.SaveWait - TimeSpan.FromMilliseconds(100));
-                Assert.True(File.Exists(Path.Combine(directory, "data-2.bin")));
+                Assert.False(File.Exists(file), "the final file must not be written past the lock");
+                Assert.True(AccountSyncDeferredSaves.IsPending(file));
+                Assert.Equal(999, manager.LoadData(Guid, 2)!.Timestamp); // the pending save is what the client gets back
+                File.WriteAllBytes(file, launcherBytes); // the launcher's own move, still under its lock
             }
+            await WaitUntilAsync(() => !AccountSyncDeferredSaves.IsPending(file), TimeSpan.FromSeconds(3));
+            Assert.Equal(clientSave, File.ReadAllBytes(file));
+            Assert.False(File.Exists(AccountSyncDeferredSaves.PathFor(file)));
         }
         finally
         {
             if (Directory.Exists(accountDirectory)) Directory.Delete(accountDirectory, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task SaveData_ANewerSaveWithTheLock_SupersedesTheDeferredOne()
+    {
+        var (manager, directory, accountDirectory) = NewManager();
+        string file = Path.Combine(directory, "data-2.bin");
+        try
+        {
+            using (HoldLauncherLock(directory))
+                await Task.Run(() => Save(manager, Saved(500)), TestContext.Current.CancellationToken);
+            Assert.True(AccountSyncDeferredSaves.IsPending(file) || File.Exists(file), "positive control: the first save was deferred or already applied");
+            Save(manager, Saved(600));
+            await Task.Delay(AccountSyncDeferredSaves.RetryInterval * 3, TestContext.Current.CancellationToken);
+            Assert.Equal(Saved(600), File.ReadAllBytes(file));
+            Assert.False(AccountSyncDeferredSaves.IsPending(file));
+            Assert.False(File.Exists(AccountSyncDeferredSaves.PathFor(file)));
+        }
+        finally
+        {
+            if (Directory.Exists(accountDirectory)) Directory.Delete(accountDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void DeferredSaves_LeftByADeadProcess_AreKeptInBackupsAndNeverApplied()
+    {
+        string directory = NewDirectory();
+        string file = Path.Combine(directory, "data-2.bin");
+        byte[] current = ChangedData(700);
+        byte[] leftover = ChangedData(300);
+        File.WriteAllBytes(file, current);
+        File.WriteAllBytes(AccountSyncDeferredSaves.PathFor(file), leftover);
+
+        AccountSyncDeferredSaves.ArchiveLeftovers(directory, DateTimeOffset.FromUnixTimeMilliseconds(1_727_000_000_000));
+
+        Assert.Equal(current, File.ReadAllBytes(file));
+        Assert.False(File.Exists(AccountSyncDeferredSaves.PathFor(file)));
+        string kept = Assert.Single(Directory.GetFiles(Path.Combine(directory, "sync-backups")));
+        Assert.Equal("data-2.bin.1727000000000.deferred.bak", Path.GetFileName(kept));
+        Assert.Equal(leftover, File.ReadAllBytes(kept));
+    }
+
+    [Fact]
+    public async Task ReconcileAtWorldEntry_ASaveWaitingForTheLock_MakesTheRestoreStandDown()
+    {
+        var (manager, directory, accountDirectory) = NewManager();
+        string file = Path.Combine(directory, "data-2.bin");
+        byte[] local = ChangedData(123);
+        File.WriteAllBytes(file, local);
+        var journal = new AccountSyncJournal();
+        journal.Documents[Key] = new() { Revision = "r1", Sha256 = AccountSyncContainer.Sha256(local) };
+        journal.Save(Path.Combine(directory, "sync-journal.json"));
+        string remoteHash = AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData);
+        using var service = Service(new FakeHandler(request => request.RequestUri!.AbsolutePath switch
+        {
+            var p when p.EndsWith("/capabilities") => Json(HttpStatusCode.OK, Capabilities()),
+            var p when p.EndsWith("/documents") => Json(HttpStatusCode.OK, ListHead("r2", remoteHash)),
+            _ => Json(HttpStatusCode.OK, Document("r2", remoteHash, AccountSyncContainerTests.RealData)),
+        }));
+        try
+        {
+            FileStream launcher = HoldLauncherLock(directory);
+            await Task.Run(() => Save(manager, Saved(999)), TestContext.Current.CancellationToken);
+            Assert.True(AccountSyncDeferredSaves.IsPending(file), "positive control: the save is deferred");
+            launcher.Dispose();
+            // The lock is free again, but the deferred save is newer than the server's copy.
+            service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
+            Assert.False(Directory.Exists(Path.Combine(directory, "sync-backups")), "no restore backup was made");
+            await WaitUntilAsync(() => !AccountSyncDeferredSaves.IsPending(file), TimeSpan.FromSeconds(3));
+            Assert.Equal(Saved(999), File.ReadAllBytes(file));
+        }
+        finally
+        {
+            if (Directory.Exists(accountDirectory)) Directory.Delete(accountDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DirectoryLock_AWaitingWriterDoesNotHoldTheGate()
+    {
+        string directory = NewDirectory();
+        using var launcher = HoldLauncherLock(directory);
+        var waiting = Task.Run(() =>
+        {
+            using var held = AccountSyncDirectoryLock.Enter(directory, TimeSpan.FromSeconds(1));
+        }, TestContext.Current.CancellationToken);
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        Assert.True(Monitor.TryEnter(AccountSyncDirectoryLock.For(directory), 0), "the gate must be free while the file lock is polled");
+        Monitor.Exit(AccountSyncDirectoryLock.For(directory));
+        await waiting;
     }
 
     /// <summary>A real second process: flock(1) takes the same lock the launcher's .NET runtime takes.</summary>
@@ -630,6 +749,14 @@ public class AccountSyncServiceTests
         byte[] data = (byte[])AccountSyncContainerTests.RealData.Clone();
         BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(16), timestamp);
         return data;
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var clock = Stopwatch.StartNew();
+        while (!condition() && clock.Elapsed < timeout)
+            await Task.Delay(20, TestContext.Current.CancellationToken);
+        Assert.True(condition(), "condition was not reached");
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

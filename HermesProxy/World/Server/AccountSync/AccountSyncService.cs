@@ -195,6 +195,8 @@ public sealed class AccountSyncService : IDisposable
                 RestoreLockAcquiredForTest?.Invoke();
                 // The launcher is replacing this file right now: leave it, the next world entry decides again.
                 if (!held.HasFileLock) return;
+                // A save of this process is waiting for the lock: it is newer than anything the server has.
+                if (AccountSyncDeferredSaves.IsPending(file)) return;
                 token.ThrowIfCancellationRequested();
                 if (!LocalMatches(file, expectedLocalHash)) return;
                 if (expectedLocalHash != null)

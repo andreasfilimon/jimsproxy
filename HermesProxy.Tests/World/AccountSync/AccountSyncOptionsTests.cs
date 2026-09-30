@@ -15,6 +15,19 @@ public class AccountSyncOptionsTests
     };
 
     [Theory]
+    [InlineData("1")]
+    [InlineData("true")]
+    [InlineData(" TRUE ")]
+    public void FromEnvironment_FileLockingDisabled_Disables(string value)
+    {
+        Assert.True(AccountSyncOptions.FromEnvironment(name => Valid.GetValueOrDefault(name)).Enabled, "positive control");
+        var values = new Dictionary<string, string?>(Valid) { ["DOTNET_SYSTEM_IO_DISABLEFILELOCKING"] = value };
+        var options = AccountSyncOptions.FromEnvironment(name => values.GetValueOrDefault(name));
+        Assert.False(options.Enabled);
+        Assert.Equal("file locking is disabled for this process", options.StatusReason);
+    }
+
+    [Theory]
     [InlineData("ST_SYNC_BASE")]
     [InlineData("ST_SYNC_TOKEN")]
     [InlineData("ST_SYNC_DEVICE_ID")]

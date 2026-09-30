@@ -18,18 +18,22 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 **Issue:** save and restore were serialized only inside the proxy process. The launcher replaces a
 binding file before it starts the proxy (conflict choice, undo); between its last "no proxy running"
 check and its atomic move a proxy started from elsewhere could write the same file, and one of the two
-writes would be lost.
+writes would be lost. Review round 1 (Terra): a first version wrote the save anyway after a 5 s wait,
+which let a stalled launcher overwrite that save afterwards.
 
-**Change:** `AccountSyncDirectoryLock` now also opens `.st-sync.lock` in the realm directory with
-`FileShare.None` (flock on Linux/macOS). `AccountDataManager.SaveData` waits up to 5 s for it and then
-saves anyway with a warning, so a client save is never dropped. Restore at world entry waits up to 2 s,
-bounded by the 1.5 s world-entry budget, and leaves the file alone when the lock stays busy.
+**Change:** `AccountSyncDirectoryLock` opens `.st-sync.lock` in the realm directory with
+`FileShare.None` (flock on Linux/macOS), polling without holding the in-process gate. The final file is
+never written without it: `SaveData` waits up to 1 s, then defers the save to `<file>.deferred`
+(`AccountSyncDeferredSaves`), which a background thread moves into place under the lock; a newer save
+supersedes it, `LoadData` reads it, a restore stands down while it is pending, and a leftover from a
+dead process goes to `sync-backups` instead of being applied. Restore waits up to 2 s, bounded by the
+1.5 s world-entry budget. `DOTNET_SYSTEM_IO_DISABLEFILELOCKING` turns account sync off.
 `docs/ACCOUNT-SYNC.md` "Lock shared with the launcher" is the contract.
 
-**Verification:** `HermesProxy.Tests` AccountSync: launcher lock blocks a restore; save waits for the
-lock, then writes; save still writes when the lock never frees; world entry stays inside its budget
-while the lock is held; a real second process (`flock(1)`) is seen; file name pinned. Placebo: each of
-six removed guards turns its test red.
+**Verification:** `HermesProxy.Tests` AccountSync 70 green: the round-1 interleaving (launcher stalls past
+the wait, client saves, launcher moves, client save wins), supersede, leftover archived, restore stands
+down, gate free while polling, world entry inside its budget, a real second process (`flock(1)`), file
+name pinned, locking switch. Placebo: each removed guard turns its test red (14 probes).
 
 ## 2026-09-29 — Opt-in cross-device sync for 1.14.2 key bindings
 

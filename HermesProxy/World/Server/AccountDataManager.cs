@@ -425,7 +425,9 @@ public class AccountDataManager
 
     public void LoadAllData(WowGuid128 guid)
     {
-        // ACCOUNT-SYNC: restore binding documents before the normal disk load.
+        // ACCOUNT-SYNC: a deferred save left by a process that died goes to sync-backups (never applied
+        // blindly); then restore binding documents before the normal disk load.
+        AccountSync.AccountSyncDeferredSaves.ArchiveLeftovers(GetAccountDataDirectory(), DateTimeOffset.UtcNow);
         AccountSync.AccountSyncRuntime.Service?.ReconcileAtWorldEntry(GetAccountDataDirectory(), _realmName, guid);
         Data = new AccountData[ModernVersion.GetAccountDataCount()];
 
@@ -438,6 +440,9 @@ public class AccountDataManager
     public AccountData? LoadData(WowGuid128 guid, uint type)
     {
         string fileName = GetFullFileName(guid, type);
+        // ACCOUNT-SYNC: a save still waiting for the lock is the newest state of this file.
+        if (AccountSync.AccountSyncDeferredSaves.IsPending(fileName))
+            fileName = AccountSync.AccountSyncDeferredSaves.PathFor(fileName);
         if (!File.Exists(fileName))
             return null;
 
@@ -490,27 +495,36 @@ public class AccountDataManager
 
         string finalPath = GetFullFileName(guid, type);
         string tempPath = finalPath + ".tmp";
+        byte[] bytes = new byte[36 + compressedData.Length];
+        using (var writer = new BinaryWriter(new MemoryStream(bytes)))
+        {
+            writer.Write(guid.GetLowValue());
+            writer.Write(guid.GetHighValue());
+            writer.Write(timestamp);
+            writer.Write(type);
+            writer.Write(uncompressedSize);
+            writer.Write(compressedData.Length);
+            writer.Write(compressedData);
+        }
 
-        // ACCOUNT-SYNC: serialize local saves with a restore's final compare-and-swap (in-process gate)
-        // and with the launcher's queued replace (lock file). The client's save always happens: if the
-        // launcher does not let go in time the file is written anyway and the miss is logged.
-        using (var held = AccountSync.AccountSyncDirectoryLock.Enter(Path.GetDirectoryName(finalPath)!, AccountSync.AccountSyncDirectoryLock.SaveWait))
+        // ACCOUNT-SYNC: the final file is written only under the directory lock shared with the launcher
+        // (and with a restore's compare-and-swap in this process). If the launcher does not let go in time
+        // the save is deferred, never dropped and never written past the lock (docs/ACCOUNT-SYNC.md).
+        string directory = GetAccountDataDirectory();
+        using (var held = AccountSync.AccountSyncDirectoryLock.Enter(directory, AccountSync.AccountSyncDirectoryLock.SaveWait))
         {
             if (!held.HasFileLock)
-                Log.Print(LogType.Warn, "account sync: the AccountData lock stayed busy, saving without it");
+            {
+                Log.Print(LogType.Warn, "account sync: the AccountData lock stayed busy, the save is written as soon as it frees");
+                AccountSync.AccountSyncDeferredSaves.Defer(finalPath, bytes,
+                    () => AccountSync.AccountSyncRuntime.Service?.EnqueueSaved(directory, _realmName, guid, type));
+                return;
+            }
             try
             {
-                using (BinaryWriter writer = new BinaryWriter(File.Open(tempPath, FileMode.Create)))
-                {
-                    writer.Write(guid.GetLowValue());
-                    writer.Write(guid.GetHighValue());
-                    writer.Write(timestamp);
-                    writer.Write(type);
-                    writer.Write(uncompressedSize);
-                    writer.Write(compressedData.Length);
-                    writer.Write(compressedData);
-                }
+                File.WriteAllBytes(tempPath, bytes);
                 File.Move(tempPath, finalPath, overwrite: true);
+                AccountSync.AccountSyncDeferredSaves.Supersede(finalPath);
             }
             finally
             {
@@ -519,7 +533,7 @@ public class AccountDataManager
         }
 
         // ACCOUNT-SYNC: queue binding uploads after the atomic local save.
-        AccountSync.AccountSyncRuntime.Service?.EnqueueSaved(GetAccountDataDirectory(), _realmName, guid, type);
+        AccountSync.AccountSyncRuntime.Service?.EnqueueSaved(directory, _realmName, guid, type);
     }
 
     public byte[] LoadCUFProfiles()

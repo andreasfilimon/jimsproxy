@@ -91,8 +91,13 @@ The server must enforce the same canonical keys and container limits. It should 
 On a local test server (2026-09-28, test account only) the 1.14.2 client took whatever `data-2.bin` the proxy
 served at world entry: a newer file replaced its bindings, and so did a file with an **older** timestamp. The client
 does not compare timestamps with its own state, so the proxy can simply put the file in place before
-`LoadAllData` reads it. Not yet measured: the same after a full client restart (only log out / log in within one
-client process), and the opposite direction with a 1.12-style full binding list.
+`LoadAllData` reads it. Measured again on 2026-09-30 with this build and the real client (headless, test account, local server):
+PC A enters the world, the bindings F9 = JUMP and F10 = TOGGLEWORLDMAP are set and saved on logout, the proxy
+uploads `data-2.bin` (78 bytes). PC B is a **fresh client process** with an empty proxy folder and no local
+`WTF/Account/<ACCOUNT>` folder: at world entry the proxy restores the byte-identical file and the client reports
+`JUMP=SPACE,NUMPAD0,F9` and `MAP=F10,M`. Control run, same setup without the `ST_SYNC_*` variables:
+`JUMP=SPACE,NUMPAD0`, `MAP=M`. Not measured: a client that keeps a stale local `WTF` folder, and the direction
+1.12 → 1.14 (not a use case: 1.12 bindings are never sent here).
 
 ## End-to-end test against a real server
 

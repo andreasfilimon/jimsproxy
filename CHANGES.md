@@ -36,7 +36,7 @@ the feature for the process, and no binding data is forwarded to the legacy game
 touch points are marked `ACCOUNT-SYNC`; `docs/ACCOUNT-SYNC.md` documents configuration, protocol,
 failure behavior, maintenance, and removal.
 
-**Verification:** `HermesProxy.Tests/World/AccountSync/` covers configuration, canonical keys, every
+**Verification:** `HermesProxy.Tests/World/AccountSync/` covers configuration, canonical keys, every Real client, 2026-09-30: bindings set on PC A arrive on a fresh PC B after a full client restart (F9 JUMP present; absent in the control run without sync).
 decision-table row, real-container validation, journal persistence, restore/backup and checksum
 rejection, the world-entry budget and local-write gates, save/restore mutual exclusion, cancellation
 cleanup, restore compare-and-swap, bounded response bodies, stable retry upload ids, transient

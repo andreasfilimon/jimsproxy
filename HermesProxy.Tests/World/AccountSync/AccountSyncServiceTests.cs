@@ -436,6 +436,64 @@ public class AccountSyncServiceTests
         Assert.Contains(handler.Requests, x => x.Method == HttpMethod.Post && x.Path.EndsWith("/conflict-candidates"));
     }
 
+    /// <summary>Found 2026-09-30: stopping the worker completed its debounce wait, and it then took the pending
+    /// upload and ran it with the cancelled token, so the shutdown flush found nothing to send.</summary>
+    [Fact]
+    public async Task Worker_StoppedWhileWaiting_LeavesThePendingUploadToTheFlush()
+    {
+        string directory = WithLocalFile();
+        int puts = 0;
+        var clock = new FakeClock();
+        var handler = new FakeHandler(request =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/capabilities")) return Json(HttpStatusCode.OK, Capabilities());
+            if (request.Method == HttpMethod.Get) return Json(HttpStatusCode.OK, EmptyList());
+            Interlocked.Increment(ref puts);
+            return Json(HttpStatusCode.OK, Head("r1", AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData)));
+        });
+        using var service = new AccountSyncService(Options(), new HttpClient(handler), clock);
+        service.EnqueueSaved(directory, "Elwynn", Guid, 2);
+        await WaitUntilAsync(() => clock.Delays.Count >= 1); // the worker waits out the debounce
+        service.StopWorkerForTest();
+        await Task.Delay(200, TestContext.Current.CancellationToken);
+        Assert.Equal(1, service.PendingCountForTest);
+        Assert.Equal(0, Volatile.Read(ref puts));
+        service.FlushPending(TimeSpan.FromSeconds(2));
+        Assert.Equal(1, Volatile.Read(ref puts));
+    }
+
+    /// <summary>Both shutdown paths (normal stop and process exit) call the flush; the second call must do nothing.</summary>
+    [Fact]
+    public async Task FlushForShutdown_CalledTwice_FlushesOnce()
+    {
+        string directory = WithLocalFile();
+        int puts = 0;
+        var handler = new FakeHandler(request =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/capabilities")) return Json(HttpStatusCode.OK, Capabilities());
+            if (request.Method == HttpMethod.Get) return Json(HttpStatusCode.OK, EmptyList());
+            Interlocked.Increment(ref puts);
+            return Json(HttpStatusCode.OK, Head("r1", AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData)));
+        });
+        using var service = new AccountSyncService(Options(), new HttpClient(handler), new FakeClock());
+        try
+        {
+            AccountSyncRuntime.UseForTest(service);
+            service.EnqueueSaved(directory, "Elwynn", Guid, 2);
+            AccountSyncRuntime.FlushForShutdown();
+            int afterFirst = Volatile.Read(ref puts);
+            Assert.Equal(1, afterFirst); // positive control: the first call uploads the pending save
+            service.EnqueueSaved(directory, "Elwynn", Guid, 2); // ignored: the service is shut down
+            AccountSyncRuntime.FlushForShutdown();
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+            Assert.Equal(afterFirst, Volatile.Read(ref puts));
+        }
+        finally
+        {
+            AccountSyncRuntime.UseForTest(null);
+        }
+    }
+
     [Fact]
     public void SyncOff_MakesNoRequestAndCreatesNoJournal()
     {

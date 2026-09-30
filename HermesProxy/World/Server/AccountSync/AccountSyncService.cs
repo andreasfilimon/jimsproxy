@@ -113,6 +113,12 @@ public sealed class AccountSyncService : IDisposable
         Volatile.Write(ref _disabled, 1);
     }
 
+    /// <summary>Tests only: stop the background worker the way <see cref="Shutdown"/> does, without the flush.</summary>
+    internal void StopWorkerForTest() => _stop.Cancel();
+
+    /// <summary>Tests only: how many uploads are waiting.</summary>
+    internal int PendingCountForTest => _pending.Count;
+
     internal async Task ReconcileUploadForTestAsync(string directory, string realmName, WowGuid128 guid, uint type,
         CancellationToken cancellationToken = default)
     {
@@ -397,6 +403,9 @@ public sealed class AccountSyncService : IDisposable
                         var signalTask = _signals.Reader.WaitToReadAsync(_stop.Token).AsTask();
                         if (await Task.WhenAny(delayTask, signalTask) == signalTask) break;
                     }
+                    // Shutdown cancels the delay, which WhenAny reports as done: leave the work to the shutdown
+                    // flush instead of taking it and running it with a token that is already cancelled.
+                    if (_stop.IsCancellationRequested) return;
                     if (_pending.TryRemove(next.Key, out var pending))
                     {
                         await ReconcileUploadAsync(pending, _stop.Token);

@@ -491,9 +491,13 @@ public class AccountDataManager
         string finalPath = GetFullFileName(guid, type);
         string tempPath = finalPath + ".tmp";
 
-        // ACCOUNT-SYNC: serialize local saves with a restore's final compare-and-swap.
-        lock (AccountSync.AccountSyncDirectoryLock.For(Path.GetDirectoryName(finalPath)!))
+        // ACCOUNT-SYNC: serialize local saves with a restore's final compare-and-swap (in-process gate)
+        // and with the launcher's queued replace (lock file). The client's save always happens: if the
+        // launcher does not let go in time the file is written anyway and the miss is logged.
+        using (var held = AccountSync.AccountSyncDirectoryLock.Enter(Path.GetDirectoryName(finalPath)!, AccountSync.AccountSyncDirectoryLock.SaveWait))
         {
+            if (!held.HasFileLock)
+                Log.Print(LogType.Warn, "account sync: the AccountData lock stayed busy, saving without it");
             try
             {
                 using (BinaryWriter writer = new BinaryWriter(File.Open(tempPath, FileMode.Create)))

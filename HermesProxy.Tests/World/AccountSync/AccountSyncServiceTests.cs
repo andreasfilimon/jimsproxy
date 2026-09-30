@@ -450,6 +450,157 @@ public class AccountSyncServiceTests
         Assert.False(File.Exists(Path.Combine(directory, "sync-journal.json")));
     }
 
+    private static FileStream HoldLauncherLock(string directory) => new(
+        Path.Combine(directory, AccountSyncDirectoryLock.FileName), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+    [Fact]
+    public void ReconcileAtWorldEntry_LauncherHoldsTheLockFile_LeavesTheFileForNextTime()
+    {
+        string directory = NewDirectory();
+        byte[] local = ChangedData(123);
+        File.WriteAllBytes(Path.Combine(directory, "data-2.bin"), local);
+        var journal = new AccountSyncJournal();
+        journal.Documents[Key] = new() { Revision = "r1", Sha256 = AccountSyncContainer.Sha256(local) };
+        journal.Save(Path.Combine(directory, "sync-journal.json"));
+        string remoteHash = AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData);
+        using var service = Service(new FakeHandler(request => request.RequestUri!.AbsolutePath switch
+        {
+            var p when p.EndsWith("/capabilities") => Json(HttpStatusCode.OK, Capabilities()),
+            var p when p.EndsWith("/documents") => Json(HttpStatusCode.OK, ListHead("r2", remoteHash)),
+            _ => Json(HttpStatusCode.OK, Document("r2", remoteHash, AccountSyncContainerTests.RealData)),
+        }));
+
+        service.RestoreLockWait = TimeSpan.FromMilliseconds(100); // well inside the budget, so the lock decides
+
+        using (HoldLauncherLock(directory))
+            service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
+
+        Assert.Equal(local, File.ReadAllBytes(Path.Combine(directory, "data-2.bin")));
+        Assert.False(Directory.Exists(Path.Combine(directory, "sync-backups")));
+        Assert.Equal("r1", AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json")).Documents[Key].Revision);
+        Assert.Empty(Directory.GetFiles(directory, "*.tmp"));
+    }
+
+    [Fact]
+    public void ReconcileAtWorldEntry_LauncherHoldsTheLock_WorldEntryStaysInsideItsBudget()
+    {
+        string directory = NewDirectory();
+        byte[] local = ChangedData(123);
+        File.WriteAllBytes(Path.Combine(directory, "data-2.bin"), local);
+        var journal = new AccountSyncJournal();
+        journal.Documents[Key] = new() { Revision = "r1", Sha256 = AccountSyncContainer.Sha256(local) };
+        journal.Save(Path.Combine(directory, "sync-journal.json"));
+        string remoteHash = AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData);
+        using var service = Service(new FakeHandler(request => request.RequestUri!.AbsolutePath switch
+        {
+            var p when p.EndsWith("/capabilities") => Json(HttpStatusCode.OK, Capabilities()),
+            var p when p.EndsWith("/documents") => Json(HttpStatusCode.OK, ListHead("r2", remoteHash)),
+            _ => Json(HttpStatusCode.OK, Document("r2", remoteHash, AccountSyncContainerTests.RealData)),
+        }));
+        Assert.True(service.RestoreLockWait > TimeSpan.FromMilliseconds(1500), "positive control: the lock wait alone is longer than the budget");
+
+        var clock = Stopwatch.StartNew();
+        using (HoldLauncherLock(directory))
+            service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
+
+        Assert.True(clock.Elapsed < TimeSpan.FromMilliseconds(1850), $"world entry waited {clock.ElapsedMilliseconds} ms");
+        Assert.Equal(local, File.ReadAllBytes(Path.Combine(directory, "data-2.bin")));
+    }
+
+    /// <summary>The launcher opens a file of exactly this name; renaming it on one side silently ends the lock.</summary>
+    [Fact]
+    public void DirectoryLock_FileNameIsTheOneTheLauncherUses() =>
+        Assert.Equal(".st-sync.lock", AccountSyncDirectoryLock.FileName);
+
+    [Fact]
+    public async Task SaveData_WhileTheLauncherHoldsTheLock_WaitsThenSaves()
+    {
+        string account = "sync-lock-test-" + System.Guid.NewGuid().ToString("N");
+        var manager = new AccountDataManager(account, "Elwynn") { Data = new AccountData[8] };
+        string directory = manager.GetAccountDataDirectory();
+        string accountDirectory = Directory.GetParent(directory)!.FullName;
+        byte[] saved = ChangedData(789);
+        int compressedLength = BinaryPrimitives.ReadInt32LittleEndian(saved.AsSpan(32));
+        try
+        {
+            Task save;
+            using (HoldLauncherLock(directory))
+            {
+                save = Task.Run(() => manager.SaveData(Guid, 789, 2,
+                    BinaryPrimitives.ReadUInt32LittleEndian(saved.AsSpan(28)), saved.AsSpan(36, compressedLength).ToArray()),
+                    TestContext.Current.CancellationToken);
+                await Task.Delay(300, TestContext.Current.CancellationToken);
+                Assert.False(save.IsCompleted, "the save must wait while the launcher holds the lock");
+                Assert.False(File.Exists(Path.Combine(directory, "data-2.bin")));
+            }
+            await save.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.True(File.Exists(Path.Combine(directory, "data-2.bin")));
+            Assert.True(File.Exists(Path.Combine(directory, AccountSyncDirectoryLock.FileName)), "the lock file is never deleted");
+        }
+        finally
+        {
+            if (Directory.Exists(accountDirectory)) Directory.Delete(accountDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SaveData_LauncherNeverLetsGo_StillSavesSoNoKeyIsLost()
+    {
+        string account = "sync-lock-test-" + System.Guid.NewGuid().ToString("N");
+        var manager = new AccountDataManager(account, "Elwynn") { Data = new AccountData[8] };
+        string directory = manager.GetAccountDataDirectory();
+        string accountDirectory = Directory.GetParent(directory)!.FullName;
+        byte[] saved = ChangedData(789);
+        int compressedLength = BinaryPrimitives.ReadInt32LittleEndian(saved.AsSpan(32));
+        try
+        {
+            using (HoldLauncherLock(directory))
+            {
+                var clock = Stopwatch.StartNew();
+                await Task.Run(() => manager.SaveData(Guid, 789, 2,
+                    BinaryPrimitives.ReadUInt32LittleEndian(saved.AsSpan(28)), saved.AsSpan(36, compressedLength).ToArray()),
+                    TestContext.Current.CancellationToken);
+                Assert.True(clock.Elapsed >= AccountSyncDirectoryLock.SaveWait - TimeSpan.FromMilliseconds(100));
+                Assert.True(File.Exists(Path.Combine(directory, "data-2.bin")));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(accountDirectory)) Directory.Delete(accountDirectory, recursive: true);
+        }
+    }
+
+    /// <summary>A real second process: flock(1) takes the same lock the launcher's .NET runtime takes.</summary>
+    [Fact]
+    public async Task DirectoryLock_AnotherProcessHoldingTheFile_IsSeen()
+    {
+        if (!OperatingSystem.IsLinux() || !File.Exists("/usr/bin/flock")) return;
+        string directory = NewDirectory();
+        string lockFile = Path.Combine(directory, AccountSyncDirectoryLock.FileName);
+        File.WriteAllBytes(lockFile, []);
+        using (var holder = Process.Start(new ProcessStartInfo("/usr/bin/flock", ["-x", lockFile, "sleep", "30"]))!)
+        {
+            try
+            {
+                bool busy = false;
+                for (int i = 0; i < 100 && !busy; i++)
+                {
+                    using var probe = AccountSyncDirectoryLock.Enter(directory, TimeSpan.Zero);
+                    busy = !probe.HasFileLock;
+                    if (!busy) { probe.Dispose(); await Task.Delay(20, TestContext.Current.CancellationToken); }
+                }
+                Assert.True(busy, "the lock held by another process must be seen");
+            }
+            finally
+            {
+                holder.Kill(entireProcessTree: true);
+                await holder.WaitForExitAsync(TestContext.Current.CancellationToken);
+            }
+        }
+        using var after = AccountSyncDirectoryLock.Enter(directory, TimeSpan.FromSeconds(2));
+        Assert.True(after.HasFileLock);
+    }
+
     private static AccountSyncService Service(HttpMessageHandler handler) => new(Options(), new HttpClient(handler));
     private static AccountSyncOptions Options() => new()
     {

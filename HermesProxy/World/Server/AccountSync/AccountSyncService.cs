@@ -36,6 +36,9 @@ public sealed class AccountSyncService : IDisposable
     internal Action? RestoreLockAcquiredForTest { get; set; }
 
     /// <summary>Creates a service. The supplied HttpClient is reused for every request.</summary>
+    /// <summary>How long a restore waits for the launcher's lock; the world-entry budget cuts it shorter.</summary>
+    internal TimeSpan RestoreLockWait { get; set; } = AccountSyncDirectoryLock.RestoreWait;
+
     public AccountSyncService(AccountSyncOptions options, HttpClient http, IAccountSyncClock? clock = null)
         : this(options, http, clock, ownsHttp: false) { }
 
@@ -187,9 +190,11 @@ public sealed class AccountSyncService : IDisposable
             token.ThrowIfCancellationRequested();
             File.WriteAllBytes(temp, payload);
             RestoreTempWrittenForTest?.Invoke();
-            lock (AccountSyncDirectoryLock.For(directory))
+            using (var held = AccountSyncDirectoryLock.Enter(directory, RestoreLockWait, token))
             {
                 RestoreLockAcquiredForTest?.Invoke();
+                // The launcher is replacing this file right now: leave it, the next world entry decides again.
+                if (!held.HasFileLock) return;
                 token.ThrowIfCancellationRequested();
                 if (!LocalMatches(file, expectedLocalHash)) return;
                 if (expectedLocalHash != null)

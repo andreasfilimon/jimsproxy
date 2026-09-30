@@ -56,7 +56,7 @@ The existing files remain byte-for-byte AccountData containers:
 
 `u64 guidLow, u64 guidHigh, i64 timestamp, u32 type, u32 uncompressedSize, i32 compressedSize, byte[compressedSize]`, little-endian, followed by zlib data.
 
-The proxy uploads and restores the whole file. Before restore it verifies the advertised SHA-256 and byte length, type, the type 3 GUID, compressed length, zlib stream, exact inflated length, 128 KiB whole-file limit, and 1 MiB inflated limit. Save and restore share one process-wide synchronous lock per AccountData directory. Under that lock, restore re-reads and hashes the local file, makes the backup, and replaces the file; a save that arrives during this final section waits and writes its newer bytes afterward. If the hash differs from the one used for the reconciliation decision, restore stops, keeps the concurrent local save, and leaves the journal unchanged.
+The proxy uploads and restores the whole file. Before restore it verifies the advertised SHA-256 and byte length, type, the type 3 GUID, compressed length, zlib stream, exact inflated length, 128 KiB whole-file limit, and 1 MiB inflated limit. Save and restore share one process-wide synchronous lock per AccountData directory, plus the cross-process lock file described below. Under that lock, restore re-reads and hashes the local file, makes the backup, and replaces the file; a save that arrives during this final section waits and writes its newer bytes afterward. If the hash differs from the one used for the reconciliation decision, restore stops, keeps the concurrent local save, and leaves the journal unchanged.
 
 The feature can create these items beneath `AccountData/<ACCOUNT>/<Realm>/`:
 
@@ -65,6 +65,18 @@ The feature can create these items beneath `AccountData/<ACCOUNT>/<Realm>/`:
 - Short-lived `.tmp`/`.sync.tmp` files used for atomic replacement; successful, failed, and budget-cancelled writes clean them up.
 
 A missing local file is never treated as deletion. Network errors, malformed or oversized responses, invalid payloads, 413, 429, and timeouts keep local data. A 401 or 403 disables sync for the rest of the process. HTTP 413 and other 4xx responses except 409/429 are not retried. No token, payload, hash, or document key is logged.
+
+## Lock shared with the launcher
+
+The Stonetavern launcher may replace a type 2/3 file before it starts the proxy (a conflict choice or an undo the player queued). To keep that write and a proxy write apart, both sides open `.st-sync.lock` in the AccountData realm directory (`AccountData/<account>/<realm>/`) with `FileShare.None` and hold it for the final check, backup and move. On Windows that is a share mode, on Linux and macOS .NET takes a `flock` on the file, so the lock works between the two processes and through the macOS `Hermes/bin/AccountData` symlink (it locks the file, not the path). The operating system releases it when a process dies; the file is never deleted, so both sides always lock the same inode.
+
+| Side | Waits | When the lock stays busy |
+|---|---|---|
+| Proxy, client save (`SaveData`) | up to 5 s | writes anyway and logs `account sync: the AccountData lock stayed busy, saving without it`; a key the player set is never dropped |
+| Proxy, restore at world entry | up to 2 s, cut short by the 1.5 s world-entry budget | leaves the file and the journal alone; the next world entry decides again |
+| Launcher, queued replace or undo | up to 2 s | writes nothing and keeps the choice queued for the next Play |
+
+The launcher checks again, while it holds the lock, that no client and no proxy process is running before it writes. The file name is pinned by a test on both sides (`DirectoryLock_FileNameIsTheOneTheLauncherUses` here, `The_file_name_is_the_one_the_proxy_uses` in the launcher); change it only together.
 
 ## Required server API
 

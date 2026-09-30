@@ -13,6 +13,24 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-30 — Account sync: lock file shared with the launcher
+
+**Issue:** save and restore were serialized only inside the proxy process. The launcher replaces a
+binding file before it starts the proxy (conflict choice, undo); between its last "no proxy running"
+check and its atomic move a proxy started from elsewhere could write the same file, and one of the two
+writes would be lost.
+
+**Change:** `AccountSyncDirectoryLock` now also opens `.st-sync.lock` in the realm directory with
+`FileShare.None` (flock on Linux/macOS). `AccountDataManager.SaveData` waits up to 5 s for it and then
+saves anyway with a warning, so a client save is never dropped. Restore at world entry waits up to 2 s,
+bounded by the 1.5 s world-entry budget, and leaves the file alone when the lock stays busy.
+`docs/ACCOUNT-SYNC.md` "Lock shared with the launcher" is the contract.
+
+**Verification:** `HermesProxy.Tests` AccountSync: launcher lock blocks a restore; save waits for the
+lock, then writes; save still writes when the lock never frees; world entry stays inside its budget
+while the lock is held; a real second process (`flock(1)`) is seen; file name pinned. Placebo: each of
+six removed guards turns its test red.
+
 ## 2026-09-29 — Opt-in cross-device sync for 1.14.2 key bindings
 
 **Issue:** Classic 1.14.2 stores global and per-character bindings in AccountData types 2 and 3,

@@ -13,6 +13,21 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-30 — Account sync: shutdown flush really sends what is pending
+
+**Issue:** found while testing the macOS port. Shutdown cancelled the worker's debounce wait; `Task.WhenAny`
+reported the cancelled wait as done, so the worker took the pending upload and ran it with the cancelled token,
+and the shutdown flush then found nothing to send. The save stayed local and went up at the next world entry,
+so nothing was lost, but "flushed at shutdown" was not true. The flush was also called from two places.
+
+**Change:** `AccountSyncService`: the worker does not take work once stopped; if it is stopped while an upload
+runs, it hands the upload back; `Shutdown` waits up to 500 ms for the worker before it flushes (a repeated PUT
+is harmless, the server keys it by `clientUploadId`). `AccountSyncRuntime.FlushForShutdown` runs once.
+
+**Verification:** `Worker_StoppedWhileWaiting_LeavesThePendingUploadToTheFlush`,
+`Shutdown_WhileTheWorkerHoldsAnUpload_StillSendsIt`, `FlushForShutdown_CalledTwice_FlushesOnce`; removing the
+stop check, the hand-back or the wait each turns its test red, deterministically.
+
 ## 2026-09-30 — Account sync: lock file shared with the launcher
 
 **Issue:** save and restore were serialized only inside the proxy process. The launcher replaces a

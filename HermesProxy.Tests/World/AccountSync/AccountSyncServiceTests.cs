@@ -462,6 +462,36 @@ public class AccountSyncServiceTests
         Assert.Equal(1, Volatile.Read(ref puts));
     }
 
+    /// <summary>Stage D round 2: shutdown lands between the worker taking an upload and running it. The upload
+    /// must still reach the server in the shutdown flush.</summary>
+    [Fact]
+    public async Task Shutdown_WhileTheWorkerHoldsAnUpload_StillSendsIt()
+    {
+        string directory = WithLocalFile();
+        int puts = 0;
+        var clock = new FakeClock();
+        var handler = new FakeHandler(request =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/capabilities")) return Json(HttpStatusCode.OK, Capabilities());
+            if (request.Method == HttpMethod.Get) return Json(HttpStatusCode.OK, EmptyList());
+            Interlocked.Increment(ref puts);
+            return Json(HttpStatusCode.OK, Head("r1", AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData)));
+        });
+        using var service = new AccountSyncService(Options(), new HttpClient(handler), clock);
+        using var took = new ManualResetEventSlim();
+        // Held until shutdown cancels, then a little longer, so a flush that does not wait for the worker
+        // would certainly run first and find the queue empty.
+        service.WorkerTookItemForTest = stop => { took.Set(); stop.WaitHandle.WaitOne(TimeSpan.FromSeconds(5)); Thread.Sleep(200); };
+        service.EnqueueSaved(directory, "Elwynn", Guid, 2);
+        await WaitUntilAsync(() => clock.Delays.Count >= 1);
+        clock.Advance(TimeSpan.FromSeconds(5)); // debounce over: the worker takes the upload and is held there
+        Assert.True(took.Wait(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken), "positive control: the worker took it");
+
+        service.Shutdown(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, Volatile.Read(ref puts));
+    }
+
     /// <summary>Both shutdown paths (normal stop and process exit) call the flush; the second call must do nothing.</summary>
     [Fact]
     public async Task FlushForShutdown_CalledTwice_FlushesOnce()

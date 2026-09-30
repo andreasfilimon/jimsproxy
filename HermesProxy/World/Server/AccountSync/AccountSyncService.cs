@@ -108,10 +108,16 @@ public sealed class AccountSyncService : IDisposable
     {
         if (Interlocked.Exchange(ref _shutdown, 1) != 0) return;
         _stop.Cancel();
+        // Let the worker hand back what it was doing before the flush looks at the queue.
+        try { _worker.Wait(TimeSpan.FromMilliseconds(500)); }
+        catch (AggregateException) { }
         FlushPending(budget);
         _pending.Clear();
         Volatile.Write(ref _disabled, 1);
     }
+
+    /// <summary>Tests only: runs right after the worker took an upload off the queue, with the stop token.</summary>
+    internal Action<CancellationToken>? WorkerTookItemForTest { get; set; }
 
     /// <summary>Tests only: stop the background worker the way <see cref="Shutdown"/> does, without the flush.</summary>
     internal void StopWorkerForTest() => _stop.Cancel();
@@ -408,7 +414,19 @@ public sealed class AccountSyncService : IDisposable
                     if (_stop.IsCancellationRequested) return;
                     if (_pending.TryRemove(next.Key, out var pending))
                     {
-                        await ReconcileUploadAsync(pending, _stop.Token);
+                        WorkerTookItemForTest?.Invoke(_stop.Token);
+                        bool finished = false;
+                        try
+                        {
+                            await ReconcileUploadAsync(pending, _stop.Token);
+                            finished = !_stop.IsCancellationRequested;
+                        }
+                        finally
+                        {
+                            // Stopped while this upload ran: hand it back to the shutdown flush, which waits for
+                            // this worker first. Sending it twice is harmless, the server keys it by clientUploadId.
+                            if (!finished && _stop.IsCancellationRequested) _pending.TryAdd(next.Key, pending);
+                        }
                         while (_signals.Reader.TryRead(out _)) { }
                     }
                 }

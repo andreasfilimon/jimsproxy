@@ -12,10 +12,12 @@ public static class AccountSyncContainer
     public const int MaxUncompressedSize = 1024 * 1024;
     private const int HeaderSize = 36;
 
-    /// <summary>Validates the header, identity, lengths, and zlib stream.</summary>
-    public static bool Validate(ReadOnlySpan<byte> bytes, uint expectedType, WowGuid128 expectedGuid)
+    /// <summary>Validates the header, identity, lengths, and zlib stream. The file-size ceiling comes
+    /// from the descriptor (<paramref name="maxFileSize"/>) so a family's own limit is honoured.</summary>
+    public static bool Validate(ReadOnlySpan<byte> bytes, uint expectedType, WowGuid128 expectedGuid,
+        int maxFileSize = MaxFileSize)
     {
-        if (bytes.Length is < HeaderSize or > MaxFileSize) return false;
+        if (bytes.Length < HeaderSize || bytes.Length > maxFileSize) return false;
         ulong low = BinaryPrimitives.ReadUInt64LittleEndian(bytes);
         ulong high = BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]);
         uint type = BinaryPrimitives.ReadUInt32LittleEndian(bytes[24..]);

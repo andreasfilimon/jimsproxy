@@ -143,10 +143,11 @@ public sealed class AccountSyncCapabilities
     [JsonPropertyName("apiVersion")]
     public int ApiVersion { get; set; }
 
-    /// <summary>Returns the usable bindings mode, or Off for an incompatible response.</summary>
-    public AccountSyncMode GetBindingsMode()
+    /// <summary>The usable mode for one switch family, or Off for an incompatible response. The caller
+    /// passes the descriptor's switch family; there is no bindings-only special case any more.</summary>
+    public AccountSyncMode GetMode(string switchFamily)
     {
-        if (ApiVersion != 1 || !Families.TryGetValue("bindings", out bool enabled) || !enabled) return AccountSyncMode.Off;
+        if (ApiVersion != 1 || !Families.TryGetValue(switchFamily, out bool enabled) || !enabled) return AccountSyncMode.Off;
         return Mode switch { "on" => AccountSyncMode.On, "upload-only" => AccountSyncMode.UploadOnly, _ => AccountSyncMode.Off };
     }
 }

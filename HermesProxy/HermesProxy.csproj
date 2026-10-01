@@ -5,6 +5,13 @@
     <InternalsVisibleTo Include="HermesProxy.Benchmarks" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The shared account-sync descriptor fixture (same content in every repo), read by
+         AccountSyncDescriptorsTests.DescriptorsMatchFixture. Embedded so the test finds it wherever
+         the assembly is built. -->
+    <EmbeddedResource Include="World/Server/AccountSync/sync-descriptors.json" />
+  </ItemGroup>
+
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <StartupObject>HermesProxy.Program</StartupObject>

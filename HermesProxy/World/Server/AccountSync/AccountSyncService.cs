@@ -140,18 +140,24 @@ public sealed class AccountSyncService : IDisposable
         try
         {
             var capabilities = await _client.GetCapabilitiesAsync(token) ?? throw new InvalidDataException("missing capabilities");
-            AccountSyncMode mode = capabilities.GetBindingsMode();
-            if (mode == AccountSyncMode.Off) return;
+            // One pass over the proxy-implemented descriptors, each with its own switch family. In P1 that
+            // is bindings only; macros stays dormant even when the server switch enables it (before P2).
+            var documents = AccountSyncDescriptors.ImplementedByProxy
+                .Where(d => capabilities.GetMode(d.SwitchFamily) != AccountSyncMode.Off)
+                .ToArray();
+            if (documents.Length == 0) return;
             var heads = await _client.ListDocumentsAsync(token) ?? throw new InvalidDataException("missing document list");
             var remoteByKey = heads.Where(h => !string.IsNullOrEmpty(h.Key) && !string.IsNullOrEmpty(h.Revision))
                 .ToDictionary(h => h.Key, StringComparer.Ordinal);
             string journalPath = Path.Combine(directory, "sync-journal.json");
             var journal = AccountSyncJournal.Load(journalPath);
 
-            foreach (uint type in new uint[] { 2, 3 })
+            foreach (var descriptor in documents)
             {
+                uint type = descriptor.Type!.Value;
+                AccountSyncMode mode = capabilities.GetMode(descriptor.SwitchFamily);
                 string key = AccountSyncKeys.Build(realmName, guid, type)!;
-                string file = GetFilePath(directory, guid, type);
+                string file = GetFilePath(directory, guid, descriptor);
                 byte[]? local = File.Exists(file) ? await File.ReadAllBytesAsync(file, token) : null;
                 string? localHash = local == null ? null : AccountSyncContainer.Sha256(local);
                 journal.Documents.TryGetValue(key, out var journalEntry);
@@ -161,7 +167,7 @@ public sealed class AccountSyncService : IDisposable
                 switch (action)
                 {
                     case AccountSyncAction.Restore:
-                        await RestoreAsync(file, directory, guid, type, key, localHash, remote!, journal, journalPath, token);
+                        await RestoreAsync(file, directory, guid, descriptor, key, localHash, remote!, journal, journalPath, token);
                         break;
                     case AccountSyncAction.Adopt:
                         Adopt(journal, journalPath, key, remote!, token: token);
@@ -183,7 +189,7 @@ public sealed class AccountSyncService : IDisposable
         }
     }
 
-    private async Task RestoreAsync(string file, string directory, WowGuid128 guid, uint type, string key, string? expectedLocalHash,
+    private async Task RestoreAsync(string file, string directory, WowGuid128 guid, AccountSyncDescriptor descriptor, string key, string? expectedLocalHash,
         AccountSyncDocumentHead remote, AccountSyncJournal journal, string journalPath, CancellationToken token)
     {
         var document = await _client.GetDocumentAsync(key, token) ?? throw new InvalidDataException("document disappeared");
@@ -193,7 +199,7 @@ public sealed class AccountSyncService : IDisposable
         if (document.Revision != remote.Revision || payload.Length != document.ByteLength || payload.Length != remote.ByteLength ||
             !string.Equals(AccountSyncContainer.Sha256(payload), remote.Sha256, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(document.Sha256, remote.Sha256, StringComparison.OrdinalIgnoreCase) ||
-            !AccountSyncContainer.Validate(payload, type, guid))
+            !AccountSyncContainer.Validate(payload, descriptor.Type!.Value, guid, descriptor.MaxBytes))
             throw new InvalidDataException("invalid remote payload");
 
         string temp = file + ".sync.tmp";
@@ -266,14 +272,16 @@ public sealed class AccountSyncService : IDisposable
         await gate.WaitAsync(outerToken);
         try
         {
-            string file = GetFilePath(pending.Directory, pending.Guid, pending.Type);
+            var descriptor = AccountSyncDescriptors.ForType(pending.Type);
+            if (descriptor is null || !descriptor.ImplementedByProxy) return;
+            string file = GetFilePath(pending.Directory, pending.Guid, descriptor);
             if (!File.Exists(file)) return;
             byte[] payload = await File.ReadAllBytesAsync(file, outerToken);
-            if (!AccountSyncContainer.Validate(payload, pending.Type, pending.Guid)) return;
+            if (!AccountSyncContainer.Validate(payload, pending.Type, pending.Guid, descriptor.MaxBytes)) return;
             string hash = AccountSyncContainer.Sha256(payload);
 
             var capabilities = await _client.GetCapabilitiesAsync(outerToken);
-            AccountSyncMode mode = capabilities?.GetBindingsMode() ?? AccountSyncMode.Off;
+            AccountSyncMode mode = capabilities?.GetMode(descriptor.SwitchFamily) ?? AccountSyncMode.Off;
             if (mode == AccountSyncMode.Off) return;
             var heads = await _client.ListDocumentsAsync(outerToken) ?? [];
             var remote = heads.FirstOrDefault(h => h.Key == pending.Key && !string.IsNullOrEmpty(h.Revision));
@@ -447,9 +455,8 @@ public sealed class AccountSyncService : IDisposable
             Log.Print(LogType.Warn, "account sync: off for this process (authorization rejected)");
     }
 
-    private static string GetFilePath(string directory, WowGuid128 guid, uint type) => type == 2
-        ? Path.Combine(directory, "data-2.bin")
-        : Path.Combine(directory, $"data-3-{guid.GetLowValue()}-{guid.GetHighValue()}.bin");
+    private static string GetFilePath(string directory, WowGuid128 guid, AccountSyncDescriptor descriptor) =>
+        Path.Combine(directory, descriptor.FileNameFor(guid.GetLowValue(), guid.GetHighValue()));
 
     /// <inheritdoc />
     public void Dispose()

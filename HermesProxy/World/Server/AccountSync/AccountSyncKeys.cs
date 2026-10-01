@@ -12,16 +12,17 @@ public static class AccountSyncKeys
             ["Barrens"] = "barrens",
         }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Returns the canonical key for a supported realm/type, or null.</summary>
+    /// <summary>Returns the canonical key for a supported realm and a proxy-implemented type, or null.
+    /// The family, scope and type segment come from the descriptor table, never a switch.</summary>
     public static string? Build(string realmName, WowGuid128 guid, uint type)
     {
         if (!RealmSlugs.TryGetValue(realmName.Trim(), out string? slug))
             return null;
-        return type switch
-        {
-            2 => $"v1/classic-era-42597/bindings/account/{slug}/-/2",
-            3 => $"v1/classic-era-42597/bindings/character/{slug}/{guid.GetLowValue()}-{guid.GetHighValue()}/3",
-            _ => null,
-        };
+        var descriptor = AccountSyncDescriptors.ForType(type);
+        if (descriptor is null || !descriptor.ImplementedByProxy)
+            return null;
+        return descriptor.IsCharacter
+            ? $"v1/{AccountSyncDescriptors.Flavor}/{descriptor.Family}/character/{slug}/{guid.GetLowValue()}-{guid.GetHighValue()}/{descriptor.TypeSegment}"
+            : $"v1/{AccountSyncDescriptors.Flavor}/{descriptor.Family}/account/{slug}/-/{descriptor.TypeSegment}";
     }
 }

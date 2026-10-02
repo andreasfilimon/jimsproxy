@@ -69,15 +69,47 @@ public static class AccountSyncDescriptors
     private static readonly FrozenDictionary<uint, AccountSyncDescriptor> ByType =
         All.Where(d => d.Type is not null).ToFrozenDictionary(d => d.Type!.Value);
 
-    private static readonly FrozenDictionary<string, AccountSyncDescriptor> ByFileName =
-        All.ToFrozenDictionary(d => d.FileName, StringComparer.Ordinal);
-
     /// <summary>The descriptor for an AccountData type, or null when no row carries it.</summary>
-    public static AccountSyncDescriptor? ForType(uint type) => ByType.GetValueOrDefault(type);
+    public static AccountSyncDescriptor? ForType(uint type) => ForType(type, All);
 
-    /// <summary>The descriptor for a proxy output file name (e.g. for RecoverLeftovers), or null.</summary>
-    public static AccountSyncDescriptor? ForFileName(string fileName) => ByFileName.GetValueOrDefault(fileName);
+    /// <summary>The type lookup over an explicit table (N1.2: tests inject a table with a family on).</summary>
+    public static AccountSyncDescriptor? ForType(uint type, IReadOnlyList<AccountSyncDescriptor>? descriptors) =>
+        (descriptors ?? All).FirstOrDefault(d => d.Type == type);
 
-    /// <summary>The rows the proxy drives at world entry and after a save.</summary>
+    /// <summary>The descriptor whose file-name pattern a proxy output name matches (RecoverLeftovers).</summary>
+    public static AccountSyncDescriptor? ForFileName(string fileName) => ForFileName(fileName, All);
+
+    /// <summary>Account files match exactly; character files match with canonical u64 GUID halves
+    /// (<c>data-5-2361-0.bin</c> matches <c>data-5-&lt;lo&gt;-&lt;hi&gt;.bin</c>, <c>data-5-x-0.bin</c> and a
+    /// leading zero do not).</summary>
+    public static AccountSyncDescriptor? ForFileName(string fileName, IReadOnlyList<AccountSyncDescriptor>? descriptors)
+    {
+        foreach (var descriptor in descriptors ?? All)
+            if (FileNameMatches(descriptor.FileName, fileName)) return descriptor;
+        return null;
+    }
+
+    internal static bool FileNameMatches(string pattern, string fileName)
+    {
+        int lo = pattern.IndexOf("<lo>", StringComparison.Ordinal);
+        if (lo < 0) return string.Equals(pattern, fileName, StringComparison.Ordinal);
+        int hi = pattern.IndexOf("<hi>", lo + 4, StringComparison.Ordinal);
+        if (hi < 0) return false;
+        string prefix = pattern[..lo];
+        string mid = pattern[(lo + 4)..hi];
+        string suffix = pattern[(hi + 4)..];
+        if (!fileName.StartsWith(prefix, StringComparison.Ordinal) || !fileName.EndsWith(suffix, StringComparison.Ordinal))
+            return false;
+        string inner = fileName[prefix.Length..(fileName.Length - suffix.Length)];
+        int midIndex = inner.IndexOf(mid, StringComparison.Ordinal);
+        if (midIndex <= 0) return false;
+        return IsCanonicalU64(inner[..midIndex]) && IsCanonicalU64(inner[(midIndex + mid.Length)..]);
+    }
+
+    private static bool IsCanonicalU64(string s) =>
+        s.Length > 0 && (s.Length == 1 || s[0] != '0') && ulong.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out _);
+
+    /// <summary>The rows the proxy drives at world entry and after a save (all of them; the caller filters
+    /// the injected table's ImplementedByProxy rows).</summary>
     public static IEnumerable<AccountSyncDescriptor> ImplementedByProxy => All.Where(d => d.ImplementedByProxy);
 }

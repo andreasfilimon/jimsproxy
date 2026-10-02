@@ -41,6 +41,21 @@ public class AccountSyncDescriptorsTests
     }
 
     [Fact]
+    public void ForFileNameFindsCharacterFile()
+    {
+        var macros = AccountSyncDescriptors.ForFileName("data-5-2361-0.bin");
+        Assert.NotNull(macros);
+        Assert.Equal("macros", macros!.Family);
+        Assert.Equal(5u, macros.Type);
+        Assert.Equal("bindings", AccountSyncDescriptors.ForFileName("data-2.bin")!.Family);
+        Assert.Null(AccountSyncDescriptors.ForFileName("data-5-x-0.bin"));
+        Assert.Null(AccountSyncDescriptors.ForFileName("data-5-02361-0.bin"));
+        Assert.Null(AccountSyncDescriptors.ForFileName("data-5-2361-0"));
+        Assert.Null(AccountSyncDescriptors.ForFileName("cuf-extra.bin"));
+        Assert.Equal("cuf", AccountSyncDescriptors.ForFileName("cuf.bin")!.Family);
+    }
+
+    [Fact]
     public void OnlyBindingsAreImplementedBeforeP2()
     {
         var active = AccountSyncDescriptors.All

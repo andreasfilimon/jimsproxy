@@ -39,6 +39,9 @@ public static class AccountSyncDeferredSaves
     /// <summary>Pause between two attempts of the background thread.</summary>
     internal static TimeSpan RetryInterval { get; set; } = TimeSpan.FromMilliseconds(200);
 
+    /// <summary>Test hook: runs under the lock right before a pending save is moved into place.</summary>
+    internal static Action<string>? BeforeMoveForTest { get; set; }
+
     public static string PathFor(string finalPath) => finalPath + Suffix;
 
     public static bool IsPending(string finalPath) => Pending.ContainsKey(Path.GetFullPath(finalPath));
@@ -102,27 +105,25 @@ public static class AccountSyncDeferredSaves
             using (var held = AccountSyncDirectoryLock.Enter(directory, wait, gateWait: wait))
             {
                 if (!held.HasFileLock) continue;
-                if (!Pending.TryRemove(finalPath, out var entry)) continue; // superseded meanwhile
+                if (!Pending.TryGetValue(finalPath, out var entry)) continue; // superseded meanwhile
                 onApplied = entry.OnApplied;
                 string deferred = PathFor(finalPath);
                 if (!Claim(finalPath, entry.Sequence))
                 {
                     if (File.Exists(deferred)) File.Delete(deferred); // a later save is already in place
+                    Pending.TryRemove(KeyValuePair.Create(finalPath, entry));
                     continue;
                 }
+                // The entry leaves the list only AFTER the move: LoadData reads the deferred file while it is
+                // pending and the final file afterwards, without the lock. Taking it out first left a window in
+                // which a reader got the old final file (found under load, 2026-10-02).
                 if (File.Exists(deferred))
                 {
-                    try
-                    {
-                        File.Move(deferred, finalPath, overwrite: true);
-                    }
-                    catch
-                    {
-                        Pending.TryAdd(finalPath, entry); // still the newest save: keep it pending
-                        throw;
-                    }
+                    BeforeMoveForTest?.Invoke(finalPath);
+                    File.Move(deferred, finalPath, overwrite: true); // on failure the entry simply stays pending
                     applied = true;
                 }
+                Pending.TryRemove(KeyValuePair.Create(finalPath, entry));
             }
             if (applied)
             {

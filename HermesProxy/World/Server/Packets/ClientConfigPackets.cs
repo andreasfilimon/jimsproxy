@@ -223,8 +223,8 @@ public class LoadCUFProfiles : ServerPacket, ISpanWritable
         _worldPacket.WriteBytes(Data);
     }
 
-    // Cap for CUF profile data - reduced from 2048 to 256 based on typical usage (30 bytes observed)
-    private const int MaxDataSize = 256;
+    // Cap for CUF profile data: 2048 (upstream value). 256 dropped five profiles with long names on load (2026-10-02).
+    private const int MaxDataSize = 2048;
     public int MaxSize => MaxDataSize;
 
     public int WriteToSpan(Span<byte> buffer)

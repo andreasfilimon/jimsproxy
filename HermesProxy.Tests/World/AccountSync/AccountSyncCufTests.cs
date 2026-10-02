@@ -25,8 +25,8 @@ public class AccountSyncCufTests
     {
         var (manager, directory, accountDirectory) = NewManager();
         string file = Path.Combine(directory, "cuf.bin");
-        byte[] old = RawCufValidatorTests.CufBlock(1, 10);
-        byte[] newer = RawCufValidatorTests.CufBlock(3, 40);
+        byte[] old = RawCufValidatorTests.CufFile("Old");
+        byte[] newer = RawCufValidatorTests.CufFile("Raid", "Party", "Solo");
         File.WriteAllBytes(file, old);
         try
         {
@@ -50,8 +50,8 @@ public class AccountSyncCufTests
     {
         string directory = NewDirectory();
         string file = Path.Combine(directory, "cuf.bin");
-        byte[] old = RawCufValidatorTests.CufBlock(1, 10);
-        byte[] newer = RawCufValidatorTests.CufBlock(2, 30);
+        byte[] old = RawCufValidatorTests.CufFile("Old");
+        byte[] newer = RawCufValidatorTests.CufFile("Primary", "Newer");
         File.WriteAllBytes(file, old);
         // A process that died between write and move leaves a whole .deferred block behind.
         File.WriteAllBytes(file + AccountSyncDeferredSaves.Suffix, newer);

@@ -84,7 +84,7 @@ public class AccountSyncDescriptorsTests
         service.FlushPending(TimeSpan.FromSeconds(2));
 
         Assert.Equal(0, service.PendingCountForTest);
-        Assert.DoesNotContain(handler.Requests, r => r.Path.Contains("macros", StringComparison.Ordinal) || r.Path.Contains("data-4", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Snapshot(), r => r.Path.Contains("macros", StringComparison.Ordinal) || r.Path.Contains("data-4", StringComparison.Ordinal));
     }
 
     private sealed record FixtureFile(string Flavor, List<FixtureRow> Descriptors);
@@ -136,9 +136,15 @@ public class AccountSyncDescriptorsTests
     {
         public List<(HttpMethod Method, string Path)> Requests { get; } = new();
 
+        /// <summary>The requests so far, copied under the lock: the upload worker keeps adding from its own thread.</summary>
+        public (HttpMethod Method, string Path)[] Snapshot()
+        {
+            lock (Requests) return Requests.ToArray();
+        }
+
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            Requests.Add((request.Method, request.RequestUri!.AbsolutePath));
+            lock (Requests) Requests.Add((request.Method, request.RequestUri!.AbsolutePath));
             return Task.FromResult(respond(request));
         }
     }

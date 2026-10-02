@@ -51,8 +51,8 @@ public class AccountSyncMacrosDarkTests
         service.FlushPending(TimeSpan.FromSeconds(2));
 
         Assert.Equal(0, service.PendingCountForTest);
-        Assert.DoesNotContain(handler.Requests, r => r.Path.Contains("macros", StringComparison.Ordinal));
-        Assert.DoesNotContain(handler.Requests, r => r.Method == HttpMethod.Put);
+        Assert.DoesNotContain(handler.Snapshot(), r => r.Path.Contains("macros", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Snapshot(), r => r.Method == HttpMethod.Put);
     }
 
     [Fact]
@@ -78,8 +78,8 @@ public class AccountSyncMacrosDarkTests
         service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
         service.FlushPending(TimeSpan.FromSeconds(3));
 
-        Assert.Contains(handler.Requests, r => r.Method == HttpMethod.Put && r.Path.Contains("/macros/", StringComparison.Ordinal));
-        Assert.DoesNotContain(handler.Requests, r => r.Path.Contains("/bindings/", StringComparison.Ordinal));
+        Assert.Contains(handler.Snapshot(), r => r.Method == HttpMethod.Put && r.Path.Contains("/macros/", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Snapshot(), r => r.Path.Contains("/bindings/", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -164,7 +164,7 @@ public class AccountSyncMacrosDarkTests
         service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
 
         bool posted = conflictPosted.Wait(TimeSpan.FromSeconds(3));
-        Assert.True(posted, "the different local copy is posted as a conflict candidate; requests: " + string.Join(", ", handler.Requests.Select(r => r.Method + " " + r.Path)));
+        Assert.True(posted, "the different local copy is posted as a conflict candidate; requests: " + string.Join(", ", handler.Snapshot().Select(r => r.Method + " " + r.Path)));
         var journal = AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json"));
         Assert.True(journal.Attempts.TryGetValue(K2, out long attemptedAt) && attemptedAt > 0, "the attempt is recorded");
         Assert.DoesNotContain(K2, journal.Documents.Keys);
@@ -227,6 +227,12 @@ public class AccountSyncMacrosDarkTests
     private sealed class FakeHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> respond) : HttpMessageHandler
     {
         public List<(HttpMethod Method, string Path)> Requests { get; } = new();
+
+        /// <summary>The requests so far, copied under the lock: the upload worker keeps adding from its own thread.</summary>
+        public (HttpMethod Method, string Path)[] Snapshot()
+        {
+            lock (Requests) return Requests.ToArray();
+        }
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {

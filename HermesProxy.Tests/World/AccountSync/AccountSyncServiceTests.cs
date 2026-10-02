@@ -294,7 +294,7 @@ public class AccountSyncServiceTests
         string[] ids = uploadIds.ToArray();
         Assert.Equal(ids[0], ids[1]);
         Assert.All(ids, id => Assert.True(System.Guid.TryParseExact(id, "D", out _)));
-        Assert.All(handler.Requests.Where(x => x.Method is not null && x.Method != HttpMethod.Get),
+        Assert.All(handler.Snapshot().Where(x => x.Method is not null && x.Method != HttpMethod.Get),
             request => Assert.Equal(conflictCandidate ? HttpMethod.Post : HttpMethod.Put, request.Method));
     }
 
@@ -415,7 +415,7 @@ public class AccountSyncServiceTests
         await service.ReconcileUploadForTestAsync(directory, "Elwynn", Guid, 2, TestContext.Current.CancellationToken);
 
         Assert.Equal("r7", AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json")).Documents[Key].Revision);
-        Assert.DoesNotContain(handler.Requests, x => x.Method == HttpMethod.Post);
+        Assert.DoesNotContain(handler.Snapshot(), x => x.Method == HttpMethod.Post);
     }
 
     [Fact]
@@ -437,7 +437,7 @@ public class AccountSyncServiceTests
 
         await service.ReconcileUploadForTestAsync(directory, "Elwynn", Guid, 2, TestContext.Current.CancellationToken);
 
-        Assert.Contains(handler.Requests, x => x.Method == HttpMethod.Post && x.Path.EndsWith("/conflict-candidates"));
+        Assert.Contains(handler.Snapshot(), x => x.Method == HttpMethod.Post && x.Path.EndsWith("/conflict-candidates"));
     }
 
     /// <summary>Found 2026-09-30: stopping the worker completed its debounce wait, and it then took the pending
@@ -538,7 +538,7 @@ public class AccountSyncServiceTests
         service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
         service.EnqueueSaved(directory, "Elwynn", Guid, 2);
 
-        Assert.Empty(handler.Requests);
+        Assert.Empty(handler.Snapshot());
         Assert.False(File.Exists(Path.Combine(directory, "sync-journal.json")));
     }
 
@@ -661,6 +661,43 @@ public class AccountSyncServiceTests
 
     /// <summary>Round 1 finding: the launcher holds the lock past the proxy's wait (it stalled before its move),
     /// the client saves meanwhile, then the launcher writes its older bytes. The client's save must win.</summary>
+    /// <summary>2026-10-02, found under CPU load: the pending entry left the list before its move, so a reader
+    /// (LoadData, the world-entry restore check) saw "not pending" and still the old final file. While the move
+    /// is under way the save must still count as pending, and LoadData must return it. Placebo: taking the
+    /// entry out before the move turns this red.</summary>
+    [Fact]
+    public async Task DeferredSave_StaysPendingUntilItsMoveIsDone()
+    {
+        var (manager, directory, accountDirectory) = NewManager();
+        string file = Path.GetFullPath(Path.Combine(directory, "data-2.bin"));
+        File.WriteAllBytes(file, ChangedData(111));
+        bool? pendingDuringMove = null;
+        long? loadedDuringMove = null;
+        AccountSyncDeferredSaves.BeforeMoveForTest = path =>
+        {
+            if (!string.Equals(path, file, StringComparison.Ordinal)) return;
+            pendingDuringMove = AccountSyncDeferredSaves.IsPending(file);
+            loadedDuringMove = manager.LoadData(Guid, 2)?.Timestamp;
+        };
+        try
+        {
+            using (HoldLauncherLock(directory))
+            {
+                await Task.Run(() => Save(manager, Saved(999)), TestContext.Current.CancellationToken);
+                Assert.True(AccountSyncDeferredSaves.IsPending(file), "positive control: the save is deferred");
+            }
+            await WaitUntilAsync(() => !AccountSyncDeferredSaves.IsPending(file), TimeSpan.FromSeconds(5));
+            Assert.True(pendingDuringMove, "the save must still be pending while it is being moved");
+            Assert.Equal(999, loadedDuringMove);
+            Assert.Equal(Saved(999), File.ReadAllBytes(file));
+        }
+        finally
+        {
+            AccountSyncDeferredSaves.BeforeMoveForTest = null;
+            if (Directory.Exists(accountDirectory)) Directory.Delete(accountDirectory, recursive: true);
+        }
+    }
+
     [Fact]
     public async Task SaveData_LauncherStallsPastTheWait_TheClientSaveStillWinsAfterTheLaunchersMove()
     {
@@ -983,12 +1020,18 @@ public class AccountSyncServiceTests
         private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _respond;
         public List<(HttpMethod Method, string Path)> Requests { get; } = new();
 
+        /// <summary>The requests so far, copied under the lock: the upload worker keeps adding from its own thread.</summary>
+        public (HttpMethod Method, string Path)[] Snapshot()
+        {
+            lock (Requests) return Requests.ToArray();
+        }
+
         public FakeHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : this((request, _) => Task.FromResult(respond(request))) { }
         public FakeHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> respond) => _respond = respond;
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            Requests.Add((request.Method, request.RequestUri!.AbsolutePath));
+            lock (Requests) Requests.Add((request.Method, request.RequestUri!.AbsolutePath));
             return _respond(request, cancellationToken);
         }
     }

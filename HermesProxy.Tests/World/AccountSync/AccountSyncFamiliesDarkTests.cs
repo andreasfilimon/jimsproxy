@@ -145,8 +145,11 @@ public class AccountSyncFamiliesDarkTests
         service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
         service.FlushPending(TimeSpan.FromSeconds(3));
 
+        // The scope is part of the key: a character family uploaded as "account" (or the reverse) must be
+        // caught, which is exactly what the placebo's wrong-scope descriptor row does.
+        string expectedSegment = $"/{family}/{(character ? "character" : "account")}/";
         var requests = WaitForPut(handler, family);
-        Assert.Contains(requests, r => r.Method == HttpMethod.Put && r.Path.Contains($"/{family}/", StringComparison.Ordinal));
+        Assert.Contains(requests, r => r.Method == HttpMethod.Put && r.Path.Contains(expectedSegment, StringComparison.Ordinal));
         Assert.DoesNotContain(requests, r => r.Path.Contains("/bindings/", StringComparison.Ordinal));
     }
 

@@ -13,12 +13,14 @@ public static class AccountSyncKeys
         }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Returns the canonical key for a supported realm and a proxy-implemented type, or null.
-    /// The family, scope and type segment come from the descriptor table, never a switch.</summary>
-    public static string? Build(string realmName, WowGuid128 guid, uint type)
+    /// The family, scope and type segment come from the descriptor table, never a switch. The optional
+    /// table lets tests run with a family turned on (N1.2); the default is the shipped table.</summary>
+    public static string? Build(string realmName, WowGuid128 guid, uint type,
+        IReadOnlyList<AccountSyncDescriptor>? descriptors = null)
     {
         if (!RealmSlugs.TryGetValue(realmName.Trim(), out string? slug))
             return null;
-        var descriptor = AccountSyncDescriptors.ForType(type);
+        var descriptor = AccountSyncDescriptors.ForType(type, descriptors);
         if (descriptor is null || !descriptor.ImplementedByProxy)
             return null;
         return descriptor.IsCharacter

@@ -13,9 +13,11 @@ public static class AccountSyncContainer
     private const int HeaderSize = 36;
 
     /// <summary>Validates the header, identity, lengths, and zlib stream. The file-size ceiling comes
-    /// from the descriptor (<paramref name="maxFileSize"/>) so a family's own limit is honoured.</summary>
+    /// from the descriptor (<paramref name="maxFileSize"/>) so a family's own limit is honoured. The GUID
+    /// is checked for every character-scope descriptor (<paramref name="requireGuidMatch"/>), not only
+    /// type 3; callers that pass the descriptor set it from <c>descriptor.IsCharacter</c>.</summary>
     public static bool Validate(ReadOnlySpan<byte> bytes, uint expectedType, WowGuid128 expectedGuid,
-        int maxFileSize = MaxFileSize)
+        int maxFileSize = MaxFileSize, bool? requireGuidMatch = null)
     {
         if (bytes.Length < HeaderSize || bytes.Length > maxFileSize) return false;
         ulong low = BinaryPrimitives.ReadUInt64LittleEndian(bytes);
@@ -25,7 +27,7 @@ public static class AccountSyncContainer
         int compressedSize = BinaryPrimitives.ReadInt32LittleEndian(bytes[32..]);
         if (type != expectedType || unpackedSize > MaxUncompressedSize || compressedSize < 0 || compressedSize != bytes.Length - HeaderSize)
             return false;
-        if (expectedType == 3 && (low != expectedGuid.GetLowValue() || high != expectedGuid.GetHighValue()))
+        if ((requireGuidMatch ?? (expectedType == 3)) && (low != expectedGuid.GetLowValue() || high != expectedGuid.GetHighValue()))
             return false;
 
         try

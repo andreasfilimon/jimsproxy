@@ -63,7 +63,10 @@ public class AccountSyncServiceTests
         service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
 
         Assert.False(File.Exists(Path.Combine(directory, "data-2.bin")));
-        Assert.False(File.Exists(Path.Combine(directory, "sync-journal.json")));
+        // P2 records the attempt before the network (fairness, plan §5 P2.4), so the journal may exist,
+        // but it must never hold a confirmed revision for a payload that failed its hash.
+        var journal = AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json"));
+        Assert.All(journal.Documents.Values, entry => Assert.Equal("", entry.Revision));
     }
 
     [Fact]

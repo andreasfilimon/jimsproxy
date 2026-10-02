@@ -65,4 +65,8 @@ public sealed class AccountSyncJournalEntry
     public string Revision { get; set; } = "";
     [JsonPropertyName("sha256")]
     public string Sha256 { get; set; } = "";
+    /// <summary>Unix milliseconds of the last reconciliation attempt, 0 when never attempted. Written
+    /// before the network so a hanging document moves to the back of the fairness order (plan §5 P2.4).</summary>
+    [JsonPropertyName("lastAttemptAt")]
+    public long LastAttemptAt { get; set; }
 }

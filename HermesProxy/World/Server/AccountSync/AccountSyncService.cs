@@ -9,6 +9,8 @@ namespace HermesProxy.World.Server.AccountSync;
 public sealed class AccountSyncService : IDisposable
 {
     private static readonly TimeSpan FetchBudget = TimeSpan.FromMilliseconds(1500);
+    /// <summary>Each document's own slice of the world-entry budget; a hang cannot starve the others.</summary>
+    private static readonly TimeSpan PerDocumentBudget = TimeSpan.FromMilliseconds(400);
     private static readonly TimeSpan Debounce = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan[] RetryDelays =
     [
@@ -18,6 +20,7 @@ public sealed class AccountSyncService : IDisposable
     ];
     private readonly AccountSyncOptions _options;
     private readonly AccountSyncClient _client;
+    private readonly IReadOnlyList<AccountSyncDescriptor> _descriptors;
     private readonly IAccountSyncClock _clock;
     private readonly Channel<string> _signals = Channel.CreateBounded<string>(new BoundedChannelOptions(1)
     {
@@ -39,21 +42,25 @@ public sealed class AccountSyncService : IDisposable
     /// <summary>How long a restore waits for the launcher's lock; the world-entry budget cuts it shorter.</summary>
     internal TimeSpan RestoreLockWait { get; set; } = AccountSyncDirectoryLock.RestoreWait;
 
-    public AccountSyncService(AccountSyncOptions options, HttpClient http, IAccountSyncClock? clock = null)
-        : this(options, http, clock, ownsHttp: false) { }
+    public AccountSyncService(AccountSyncOptions options, HttpClient http, IAccountSyncClock? clock = null,
+        IReadOnlyList<AccountSyncDescriptor>? descriptors = null)
+        : this(options, http, clock, ownsHttp: false, descriptors) { }
 
-    private AccountSyncService(AccountSyncOptions options, HttpClient http, IAccountSyncClock? clock, bool ownsHttp)
+    private AccountSyncService(AccountSyncOptions options, HttpClient http, IAccountSyncClock? clock, bool ownsHttp,
+        IReadOnlyList<AccountSyncDescriptor>? descriptors = null)
     {
         _options = options;
         _client = new AccountSyncClient(options, http);
         _clock = clock ?? new SystemAccountSyncClock();
         _ownedHttp = ownsHttp ? http : null;
+        _descriptors = descriptors ?? AccountSyncDescriptors.All;
         _worker = options.Enabled ? Task.Run(WorkerAsync) : Task.CompletedTask;
     }
 
     /// <summary>Creates a service over an injected HTTP handler for tests or alternate transports.</summary>
-    public AccountSyncService(AccountSyncOptions options, HttpMessageHandler handler, IAccountSyncClock? clock = null)
-        : this(options, new HttpClient(handler, disposeHandler: false), clock, ownsHttp: true) { }
+    public AccountSyncService(AccountSyncOptions options, HttpMessageHandler handler, IAccountSyncClock? clock = null,
+        IReadOnlyList<AccountSyncDescriptor>? descriptors = null)
+        : this(options, new HttpClient(handler, disposeHandler: false), clock, ownsHttp: true, descriptors) { }
 
     /// <summary>True while configured and not process-disabled by authorization failure.</summary>
     public bool IsEnabled => _options.Enabled && Volatile.Read(ref _disabled) == 0;
@@ -61,7 +68,10 @@ public sealed class AccountSyncService : IDisposable
     /// <summary>Reconciles types 2 and 3 with one shared 1.5 second network budget and local-write start gate.</summary>
     public void ReconcileAtWorldEntry(string directory, string realmName, WowGuid128 guid)
     {
-        if (!IsEnabled || AccountSyncKeys.Build(realmName, guid, 2) == null) return;
+        if (!IsEnabled) return;
+        var firstImplemented = _descriptors.FirstOrDefault(d => d.ImplementedByProxy && d.Type is not null);
+        if (firstImplemented is null || AccountSyncKeys.Build(realmName, guid, firstImplemented.Type!.Value, _descriptors) == null)
+            return;
         using var budget = new CancellationTokenSource(FetchBudget);
         try
         {
@@ -82,7 +92,7 @@ public sealed class AccountSyncService : IDisposable
     public void EnqueueSaved(string directory, string realmName, WowGuid128 guid, uint type)
     {
         if (!IsEnabled) return;
-        string? key = AccountSyncKeys.Build(realmName, guid, type);
+        string? key = AccountSyncKeys.Build(realmName, guid, type, _descriptors);
         if (key == null) return;
         Queue(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow + Debounce));
     }
@@ -128,7 +138,7 @@ public sealed class AccountSyncService : IDisposable
     internal async Task ReconcileUploadForTestAsync(string directory, string realmName, WowGuid128 guid, uint type,
         CancellationToken cancellationToken = default)
     {
-        string? key = AccountSyncKeys.Build(realmName, guid, type);
+        string? key = AccountSyncKeys.Build(realmName, guid, type, _descriptors);
         if (!IsEnabled || key == null) return;
         await ReconcileUploadAsync(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow), cancellationToken);
     }
@@ -140,46 +150,71 @@ public sealed class AccountSyncService : IDisposable
         try
         {
             var capabilities = await _client.GetCapabilitiesAsync(token) ?? throw new InvalidDataException("missing capabilities");
-            // One pass over the proxy-implemented descriptors, each with its own switch family. In P1 that
-            // is bindings only; macros stays dormant even when the server switch enables it (before P2).
-            var documents = AccountSyncDescriptors.ImplementedByProxy
+            // One pass over the proxy-implemented descriptors, each with its own switch family. In the
+            // shipped table that is bindings only; a test table can turn a family on (N1.2).
+            var enabled = _descriptors
+                .Where(d => d.ImplementedByProxy && d.Type is not null)
                 .Where(d => capabilities.GetMode(d.SwitchFamily) != AccountSyncMode.Off)
                 .ToArray();
-            if (documents.Length == 0) return;
+            if (enabled.Length == 0) return;
             var heads = await _client.ListDocumentsAsync(token) ?? throw new InvalidDataException("missing document list");
             var remoteByKey = heads.Where(h => !string.IsNullOrEmpty(h.Key) && !string.IsNullOrEmpty(h.Revision))
                 .ToDictionary(h => h.Key, StringComparer.Ordinal);
             string journalPath = Path.Combine(directory, "sync-journal.json");
             var journal = AccountSyncJournal.Load(journalPath);
 
-            foreach (var descriptor in documents)
+            // bindings first, then the rest by lastAttemptAt ascending: a document that ran out of its
+            // own sub-budget moves to the back on the next world entry (plan §5 P2.4).
+            var ordered = enabled
+                .Select(d => (Descriptor: d, Key: AccountSyncKeys.Build(realmName, guid, d.Type!.Value, _descriptors)!))
+                .OrderByDescending(x => x.Descriptor.SwitchFamily == "bindings")
+                .ThenBy(x => journal.Documents.TryGetValue(x.Key, out var entry) ? entry.LastAttemptAt : 0)
+                .ToArray();
+
+            foreach (var (descriptor, key) in ordered)
             {
+                if (token.IsCancellationRequested) break;
                 uint type = descriptor.Type!.Value;
                 AccountSyncMode mode = capabilities.GetMode(descriptor.SwitchFamily);
-                string key = AccountSyncKeys.Build(realmName, guid, type)!;
-                string file = GetFilePath(directory, guid, descriptor);
-                byte[]? local = File.Exists(file) ? await File.ReadAllBytesAsync(file, token) : null;
-                string? localHash = local == null ? null : AccountSyncContainer.Sha256(local);
-                journal.Documents.TryGetValue(key, out var journalEntry);
-                remoteByKey.TryGetValue(key, out var remote);
-                var action = AccountSyncDecision.Decide(localHash, journalEntry, remote, mode);
-
-                switch (action)
+                // Mark the attempt before the network, so a timeout still moves this document back next time.
+                MarkAttempt(journal, key);
+                using var perDocument = CancellationTokenSource.CreateLinkedTokenSource(token);
+                perDocument.CancelAfter(PerDocumentBudget);
+                try
                 {
-                    case AccountSyncAction.Restore:
-                        await RestoreAsync(file, directory, guid, descriptor, key, localHash, remote!, journal, journalPath, token);
-                        break;
-                    case AccountSyncAction.Adopt:
-                        Adopt(journal, journalPath, key, remote!, token: token);
-                        break;
-                    case AccountSyncAction.UploadCreate:
-                    case AccountSyncAction.UploadMatch:
-                    case AccountSyncAction.ConflictCandidate:
-                        Queue(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow));
-                        break;
-                    case AccountSyncAction.ConflictBlocked:
-                        Log.Print(LogType.Warn, "account sync: remote binding conflict awaits launcher resolution");
-                        break;
+                    string file = GetFilePath(directory, guid, descriptor);
+                    byte[]? local = File.Exists(file) ? await File.ReadAllBytesAsync(file, perDocument.Token) : null;
+                    string? localHash = local == null ? null : AccountSyncContainer.Sha256(local);
+                    journal.Documents.TryGetValue(key, out var journalEntry);
+                    remoteByKey.TryGetValue(key, out var remote);
+                    var action = AccountSyncDecision.Decide(localHash, journalEntry, remote, mode);
+
+                    switch (action)
+                    {
+                        case AccountSyncAction.Restore:
+                            await RestoreAsync(file, directory, guid, descriptor, key, localHash, remote!, journal, journalPath, perDocument.Token);
+                            break;
+                        case AccountSyncAction.Adopt:
+                            Adopt(journal, journalPath, key, remote!, token: perDocument.Token);
+                            break;
+                        case AccountSyncAction.UploadCreate:
+                        case AccountSyncAction.UploadMatch:
+                        case AccountSyncAction.ConflictCandidate:
+                            Queue(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow));
+                            break;
+                        case AccountSyncAction.ConflictBlocked:
+                            Log.Print(LogType.Warn, "account sync: remote document conflict awaits launcher resolution");
+                            break;
+                    }
+                }
+                catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                {
+                    // This document used its own 400 ms sub-budget; the others keep their turn.
+                }
+                finally
+                {
+                    // Persist the attempt even after a timeout or failure.
+                    TryPersistJournal(journal, journalPath, token);
                 }
             }
         }
@@ -187,6 +222,25 @@ public sealed class AccountSyncService : IDisposable
         {
             gate.Release();
         }
+    }
+
+    /// <summary>Marks a document as attempted-now, keeping its last confirmed revision/hash.</summary>
+    private void MarkAttempt(AccountSyncJournal journal, string key)
+    {
+        journal.Documents.TryGetValue(key, out var entry);
+        journal.Documents[key] = new AccountSyncJournalEntry
+        {
+            Revision = entry?.Revision ?? "",
+            Sha256 = entry?.Sha256 ?? "",
+            LastAttemptAt = _clock.UtcNow.ToUnixTimeMilliseconds(),
+        };
+    }
+
+    private static void TryPersistJournal(AccountSyncJournal journal, string journalPath, CancellationToken token)
+    {
+        try { journal.SaveWithinBudget(journalPath, token); }
+        catch (OperationCanceledException) { }
+        catch (IOException) { }
     }
 
     private async Task RestoreAsync(string file, string directory, WowGuid128 guid, AccountSyncDescriptor descriptor, string key, string? expectedLocalHash,
@@ -199,7 +253,7 @@ public sealed class AccountSyncService : IDisposable
         if (document.Revision != remote.Revision || payload.Length != document.ByteLength || payload.Length != remote.ByteLength ||
             !string.Equals(AccountSyncContainer.Sha256(payload), remote.Sha256, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(document.Sha256, remote.Sha256, StringComparison.OrdinalIgnoreCase) ||
-            !AccountSyncContainer.Validate(payload, descriptor.Type!.Value, guid, descriptor.MaxBytes))
+            !AccountSyncContainer.Validate(payload, descriptor.Type!.Value, guid, descriptor.MaxBytes, descriptor.IsCharacter))
             throw new InvalidDataException("invalid remote payload");
 
         string temp = file + ".sync.tmp";
@@ -228,7 +282,7 @@ public sealed class AccountSyncService : IDisposable
             if (File.Exists(temp)) File.Delete(temp);
         }
         token.ThrowIfCancellationRequested();
-        journal.Documents[key] = new() { Revision = remote.Revision, Sha256 = remote.Sha256 };
+        UpdateEntry(journal, key, remote.Revision, remote.Sha256);
         journal.SaveWithinBudget(journalPath, token);
     }
 
@@ -272,12 +326,12 @@ public sealed class AccountSyncService : IDisposable
         await gate.WaitAsync(outerToken);
         try
         {
-            var descriptor = AccountSyncDescriptors.ForType(pending.Type);
+            var descriptor = AccountSyncDescriptors.ForType(pending.Type, _descriptors);
             if (descriptor is null || !descriptor.ImplementedByProxy) return;
             string file = GetFilePath(pending.Directory, pending.Guid, descriptor);
             if (!File.Exists(file)) return;
             byte[] payload = await File.ReadAllBytesAsync(file, outerToken);
-            if (!AccountSyncContainer.Validate(payload, pending.Type, pending.Guid, descriptor.MaxBytes)) return;
+            if (!AccountSyncContainer.Validate(payload, pending.Type, pending.Guid, descriptor.MaxBytes, descriptor.IsCharacter)) return;
             string hash = AccountSyncContainer.Sha256(payload);
 
             var capabilities = await _client.GetCapabilitiesAsync(outerToken);
@@ -357,8 +411,20 @@ public sealed class AccountSyncService : IDisposable
         string? hash = null, CancellationToken token = default)
     {
         token.ThrowIfCancellationRequested();
-        journal.Documents[key] = new() { Revision = head.Revision, Sha256 = hash ?? head.Sha256 };
+        UpdateEntry(journal, key, head.Revision, hash ?? head.Sha256);
         journal.SaveWithinBudget(path, token);
+    }
+
+    /// <summary>Writes revision/hash for a key while keeping its lastAttemptAt (the fairness ordering).</summary>
+    private static void UpdateEntry(AccountSyncJournal journal, string key, string revision, string sha256)
+    {
+        journal.Documents.TryGetValue(key, out var prior);
+        journal.Documents[key] = new AccountSyncJournalEntry
+        {
+            Revision = revision,
+            Sha256 = sha256,
+            LastAttemptAt = prior?.LastAttemptAt ?? 0,
+        };
     }
 
     private void Queue(PendingUpload pending)

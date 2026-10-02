@@ -13,6 +13,21 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-02 — Account sync: a re-stamped file is not uploaded again
+
+**Issue:** measured in the staging world (launcher → proxy → 1.14.2 client): the client rewrites chat (type 7) on
+every logout with a new time field and identical content. The proxy compared whole-file hashes, so each logout made
+one more server revision (two uploads one second apart, inflated text byte-identical) and spent the hourly write budget.
+**Change:** `AccountSyncContainer.ContentSha256` hashes the file with bytes 16-23 zeroed; the journal stores it as
+`contentSha256`, and `AccountSyncDecision.Decide` treats a local file whose content hash equals the journal's as
+unchanged. Every other byte still counts, so a real change is always uploaded. Older journals without the field keep
+the old rule (`AccountSync{Container,Decision,Journal,Service}.cs`, `docs/ACCOUNT-SYNC.md`).
+**Verification:** `AccountSyncDecisionTests` (four new cases), `AccountSyncContainerTests.ContentSha256_*`,
+`AccountSyncServiceTests.Upload_RestampedFileIsNotUploadedAgain_RealChangeIs` (re-stamp: one PUT; real change: two).
+Placebo: content comparison switched off in `Decide` → three of them red. Staging rerun in the acceptance report.
+
+---
+
 ## 2026-09-30 — Account sync: shutdown flush really sends what is pending
 
 **Issue:** found while testing the macOS port. Shutdown cancelled the worker's debounce wait; `Task.WhenAny`

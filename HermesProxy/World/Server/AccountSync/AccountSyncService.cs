@@ -192,9 +192,10 @@ public sealed class AccountSyncService : IDisposable
                     string file = GetFilePath(directory, guid, descriptor);
                     byte[]? local = File.Exists(file) ? await File.ReadAllBytesAsync(file, perDocument.Token) : null;
                     string? localHash = local == null ? null : AccountSyncContainer.Sha256(local);
+                    string? localContentHash = local == null ? null : ContentHash(descriptor, local);
                     journal.Documents.TryGetValue(key, out var journalEntry);
                     remoteByKey.TryGetValue(key, out var remote);
-                    var action = AccountSyncDecision.Decide(localHash, journalEntry, remote, mode);
+                    var action = AccountSyncDecision.Decide(localHash, journalEntry, remote, mode, localContentHash);
 
                     switch (action)
                     {
@@ -202,7 +203,7 @@ public sealed class AccountSyncService : IDisposable
                             await RestoreAsync(file, directory, guid, descriptor, key, localHash, remote!, journal, journalPath, perDocument.Token);
                             break;
                         case AccountSyncAction.Adopt:
-                            Adopt(journal, journalPath, key, remote!, token: perDocument.Token);
+                            Adopt(journal, journalPath, key, remote!, contentHash: localContentHash, token: perDocument.Token);
                             break;
                         case AccountSyncAction.UploadCreate:
                         case AccountSyncAction.UploadMatch:
@@ -285,7 +286,7 @@ public sealed class AccountSyncService : IDisposable
             if (File.Exists(temp)) File.Delete(temp);
         }
         token.ThrowIfCancellationRequested();
-        UpdateEntry(journal, key, remote.Revision, remote.Sha256);
+        UpdateEntry(journal, key, remote.Revision, remote.Sha256, ContentHash(descriptor, payload));
         journal.SaveWithinBudget(journalPath, token);
     }
 
@@ -336,6 +337,7 @@ public sealed class AccountSyncService : IDisposable
             byte[] payload = await File.ReadAllBytesAsync(file, outerToken);
             if (!IsValidPayload(descriptor, payload, pending.Guid)) return;
             string hash = AccountSyncContainer.Sha256(payload);
+            string contentHash = ContentHash(descriptor, payload);
 
             var capabilities = await _client.GetCapabilitiesAsync(outerToken);
             AccountSyncMode mode = capabilities?.GetMode(descriptor.SwitchFamily) ?? AccountSyncMode.Off;
@@ -345,11 +347,11 @@ public sealed class AccountSyncService : IDisposable
             string journalPath = Path.Combine(pending.Directory, "sync-journal.json");
             var journal = AccountSyncJournal.Load(journalPath);
             journal.Documents.TryGetValue(pending.Key, out var journalEntry);
-            var action = AccountSyncDecision.Decide(hash, journalEntry, remote, mode);
+            var action = AccountSyncDecision.Decide(hash, journalEntry, remote, mode, contentHash);
 
             if (action == AccountSyncAction.Adopt)
             {
-                Adopt(journal, journalPath, pending.Key, remote!, token: outerToken);
+                Adopt(journal, journalPath, pending.Key, remote!, contentHash: contentHash, token: outerToken);
                 return;
             }
             if (action == AccountSyncAction.ConflictBlocked || action == AccountSyncAction.Nothing || action == AccountSyncAction.Restore)
@@ -372,7 +374,7 @@ public sealed class AccountSyncService : IDisposable
             }
             if (result.StatusCode == HttpStatusCode.Conflict)
             {
-                await HandleUploadConflictAsync(pending, payload, hash, journal, journalPath, outerToken);
+                await HandleUploadConflictAsync(pending, payload, hash, contentHash, journal, journalPath, outerToken);
                 return;
             }
             if (IsTransientStatus(result.StatusCode))
@@ -381,7 +383,7 @@ public sealed class AccountSyncService : IDisposable
                 return;
             }
             if (result.StatusCode == HttpStatusCode.OK && result.Head != null)
-                Adopt(journal, journalPath, pending.Key, result.Head, hash, outerToken);
+                Adopt(journal, journalPath, pending.Key, result.Head, hash, contentHash, outerToken);
         }
         catch (Exception ex)
         {
@@ -395,14 +397,14 @@ public sealed class AccountSyncService : IDisposable
         }
     }
 
-    private async Task HandleUploadConflictAsync(PendingUpload pending, byte[] payload, string hash,
+    private async Task HandleUploadConflictAsync(PendingUpload pending, byte[] payload, string hash, string contentHash,
         AccountSyncJournal journal, string journalPath, CancellationToken token)
     {
         var heads = await _client.ListDocumentsAsync(token) ?? [];
         var head = heads.FirstOrDefault(h => h.Key == pending.Key && !string.IsNullOrEmpty(h.Revision));
         if (head != null && string.Equals(head.Sha256, hash, StringComparison.OrdinalIgnoreCase))
         {
-            Adopt(journal, journalPath, pending.Key, head, hash, token);
+            Adopt(journal, journalPath, pending.Key, head, hash, contentHash, token);
             return;
         }
         var result = await _client.PostConflictCandidateAsync(
@@ -411,21 +413,22 @@ public sealed class AccountSyncService : IDisposable
     }
 
     private static void Adopt(AccountSyncJournal journal, string path, string key, AccountSyncDocumentHead head,
-        string? hash = null, CancellationToken token = default)
+        string? hash = null, string? contentHash = null, CancellationToken token = default)
     {
         token.ThrowIfCancellationRequested();
-        UpdateEntry(journal, key, head.Revision, hash ?? head.Sha256);
+        UpdateEntry(journal, key, head.Revision, hash ?? head.Sha256, contentHash);
         journal.SaveWithinBudget(path, token);
     }
 
     /// <summary>Writes the confirmed revision/hash for a key. The attempt timestamp stays in
     /// <see cref="AccountSyncJournal.Attempts"/>, untouched by this.</summary>
-    private static void UpdateEntry(AccountSyncJournal journal, string key, string revision, string sha256)
+    private static void UpdateEntry(AccountSyncJournal journal, string key, string revision, string sha256, string? contentSha256)
     {
         journal.Documents[key] = new AccountSyncJournalEntry
         {
             Revision = revision,
             Sha256 = sha256,
+            ContentSha256 = contentSha256,
         };
     }
 
@@ -439,6 +442,13 @@ public sealed class AccountSyncService : IDisposable
     private static PendingUpload NewPendingUpload(string directory, string realmName, WowGuid128 guid,
         AccountSyncDescriptor descriptor, string key, DateTimeOffset due) => new(
         directory, realmName, guid, descriptor, key, due, 0, System.Guid.NewGuid().ToString("D"));
+
+    /// <summary>The content hash the decision table compares with the journal: without the time field for a
+    /// container, the whole file for the raw CUF block (it has no time field).</summary>
+    private static string ContentHash(AccountSyncDescriptor descriptor, byte[] payload) =>
+        descriptor.Format == AccountSyncFormat.Container
+            ? AccountSyncContainer.ContentSha256(payload)
+            : AccountSyncContainer.Sha256(payload);
 
     /// <summary>The payload check of a document, by its format: the 36-byte container, or the raw CUF
     /// block's structure (P5). One place, so restore and upload cannot disagree.</summary>

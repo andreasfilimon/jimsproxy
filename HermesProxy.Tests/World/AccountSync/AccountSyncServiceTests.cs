@@ -396,6 +396,40 @@ public class AccountSyncServiceTests
         Assert.Equal(afterFirst, calls);
     }
 
+    // Measured 2026-10-02 in the staging world: the client rewrites chat (type 7) on every logout with a new time
+    // field and identical content, and each rewrite became one more server revision. A re-stamped file must not be
+    // uploaded again; a file with a real change must.
+    [Theory]
+    [InlineData(false, 1)]
+    [InlineData(true, 2)]
+    public async Task Upload_RestampedFileIsNotUploadedAgain_RealChangeIs(bool realChange, int expectedPuts)
+    {
+        string directory = WithLocalFile();
+        string file = Path.Combine(directory, "data-2.bin");
+        string firstHash = AccountSyncContainer.Sha256(AccountSyncContainerTests.RealData);
+        bool uploaded = false;
+        var handler = new FakeHandler(request =>
+        {
+            string path = request.RequestUri!.AbsolutePath;
+            if (path.EndsWith("/capabilities")) return Json(HttpStatusCode.OK, Capabilities());
+            if (request.Method == HttpMethod.Get)
+                return Json(HttpStatusCode.OK, Volatile.Read(ref uploaded) ? ListHead("r1", firstHash) : EmptyList());
+            bool first = !Volatile.Read(ref uploaded);
+            Volatile.Write(ref uploaded, true);
+            return Json(HttpStatusCode.OK, first ? Head("r1", firstHash) : Head("r2", new string('e', 64)));
+        });
+        using var service = Service(handler);
+        await service.ReconcileUploadForTestAsync(directory, "Elwynn", Guid, 2, TestContext.Current.CancellationToken);
+        Assert.False(string.IsNullOrEmpty(AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json")).Documents[Key].ContentSha256));
+
+        byte[] next = ChangedData(1790972886);            // the client's logout rewrite: only the time moves
+        if (realChange) next[0] ^= 0x01;                 // account scope: the GUID half is not checked, the file stays valid
+        File.WriteAllBytes(file, next);
+        await service.ReconcileUploadForTestAsync(directory, "Elwynn", Guid, 2, TestContext.Current.CancellationToken);
+
+        Assert.Equal(expectedPuts, handler.Snapshot().Count(x => x.Method == HttpMethod.Put));
+    }
+
     [Fact]
     public async Task Upload_ConflictThenSameHashHead_Adopts()
     {

@@ -33,7 +33,7 @@ The GUID values are unsigned decimal `WowGuid128.GetLowValue()` and `GetHighValu
 
 ## Reconciliation table
 
-`L` is the SHA-256 of the local whole file (or none), `J` is the last-confirmed journal entry (or none), and `R` is the active server head (or none). “Newer” means a different revision id.
+`L` is the SHA-256 of the local whole file (or none), `J` is the last-confirmed journal entry (or none), and `R` is the active server head (or none). “Newer” means a different revision id. `L = J` also holds when the two differ only in the container's time field (bytes 16-23): the journal keeps a second hash with that field zeroed (`contentSha256`), because the client re-stamps some files without changing them (chat, type 7, on every logout). A journal entry without `contentSha256` (written before 2026-10-02) compares whole files only.
 
 | L | J | R | Action |
 |---|---|---|---|
@@ -60,7 +60,7 @@ The proxy uploads and restores the whole file. Before restore it verifies the ad
 
 The feature can create these items beneath `AccountData/<ACCOUNT>/<Realm>/`:
 
-- `sync-journal.json`: schema v1, atomically replaced, recording revision and hash by document key. A corrupt or unknown-version journal is treated as absent.
+- `sync-journal.json`: schema v1, atomically replaced, recording revision, hash and content hash (without the time field) by document key. A corrupt or unknown-version journal is treated as absent.
 - `sync-backups/<filename>.<unix-ms>.bak`: the previous local file before a restore. The newest ten backups per source filename are retained.
 - Short-lived `.tmp`/`.sync.tmp` files used for atomic replacement; successful, failed, and budget-cancelled writes clean them up.
 

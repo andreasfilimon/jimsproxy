@@ -74,4 +74,9 @@ public sealed class AccountSyncJournalEntry
     public string Revision { get; set; } = "";
     [JsonPropertyName("sha256")]
     public string Sha256 { get; set; } = "";
+    /// <summary>Hash of the confirmed content without the container's time field
+    /// (<see cref="AccountSyncContainer.ContentSha256"/>); absent in journals written before 2026-10-02.</summary>
+    [JsonPropertyName("contentSha256")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ContentSha256 { get; set; }
 }

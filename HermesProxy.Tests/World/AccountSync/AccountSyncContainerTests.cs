@@ -28,6 +28,34 @@ public class AccountSyncContainerTests
     }
 
     [Fact]
+    public void ContentSha256_IgnoresOnlyTheTimeField()
+    {
+        byte[] restamped = (byte[])RealData.Clone();
+        BinaryPrimitives.WriteInt64LittleEndian(restamped.AsSpan(16), 1790972886);
+        Assert.NotEqual(AccountSyncContainer.Sha256(RealData), AccountSyncContainer.Sha256(restamped));
+        Assert.Equal(AccountSyncContainer.ContentSha256(RealData), AccountSyncContainer.ContentSha256(restamped));
+    }
+
+    [Theory]
+    [InlineData(0)]   // GUID
+    [InlineData(15)]  // GUID, last byte before the time field
+    [InlineData(24)]  // type, first byte after the time field
+    [InlineData(28)]  // uncompressed size
+    [InlineData(36)]  // first byte of the zlib stream
+    [InlineData(-1)]  // last byte
+    public void ContentSha256_SeesEveryOtherByte(int offset)
+    {
+        byte[] changed = (byte[])RealData.Clone();
+        int at = offset < 0 ? changed.Length + offset : offset;
+        changed[at] ^= 0x01;
+        Assert.NotEqual(AccountSyncContainer.ContentSha256(RealData), AccountSyncContainer.ContentSha256(changed));
+    }
+
+    [Fact]
+    public void ContentSha256_ShorterThanTheHeader_IsThePlainHash() =>
+        Assert.Equal(AccountSyncContainer.Sha256(new byte[] { 1, 2, 3 }), AccountSyncContainer.ContentSha256(new byte[] { 1, 2, 3 }));
+
+    [Fact]
     public void Validate_BadCompressedLength_Rejects()
     {
         byte[] bytes = (byte[])RealData.Clone();

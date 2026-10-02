@@ -48,7 +48,7 @@ public class AccountSyncDecisionTests
     public void Decide_UploadOnlyTurnsNewerRemoteRestoreIntoNothing() =>
         Assert.Equal(AccountSyncAction.Nothing, AccountSyncDecision.Decide("a", Journal(), Remote("r2", "b"), AccountSyncMode.UploadOnly));
 
-    // The client re-stamps some documents without changing them (chat, type 7, on every logout; measured
+    // The client re-stamps some documents without changing them (chat, type 7, twice one second apart; measured
     // 2026-10-02). Local hash "b" differs from the journal's "a" only by the time field: content hash "c" on both.
     private static AccountSyncJournalEntry JournalWithContent(string revision = "r1") =>
         new() { Revision = revision, Sha256 = "a", ContentSha256 = "c" };

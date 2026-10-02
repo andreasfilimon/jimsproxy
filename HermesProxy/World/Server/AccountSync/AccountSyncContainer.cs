@@ -54,8 +54,8 @@ public static class AccountSyncContainer
     public static string Sha256(ReadOnlySpan<byte> bytes) => Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes));
 
     /// <summary>SHA-256 of the file with the header's time field (bytes 16-23) zeroed. The client rewrites some
-    /// documents with a new time and unchanged content (chat, type 7, on every logout: measured 2026-10-02 in the
-    /// staging world, two uploads one second apart with identical text). The decision table uses this hash to see
+    /// documents with a new time and unchanged content (chat, type 7: measured 2026-10-02 in the staging world, two
+    /// saves one second apart with identical text, each uploaded as its own revision). The decision table uses this hash to see
     /// that as "unchanged". Every other byte still counts, so any real change gives a different hash.</summary>
     public static string ContentSha256(ReadOnlySpan<byte> bytes)
     {

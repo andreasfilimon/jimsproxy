@@ -396,8 +396,8 @@ public class AccountSyncServiceTests
         Assert.Equal(afterFirst, calls);
     }
 
-    // Measured 2026-10-02 in the staging world: the client rewrites chat (type 7) on every logout with a new time
-    // field and identical content, and each rewrite became one more server revision. A re-stamped file must not be
+    // Measured 2026-10-02 in the staging world: the client saved chat (type 7) twice, one second apart, with a new
+    // time field and identical content, and each save became its own server revision. A re-stamped file must not be
     // uploaded again; a file with a real change must.
     [Theory]
     [InlineData(false, 1)]

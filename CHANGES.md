@@ -13,11 +13,25 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-02 — Account sync: CUF profiles go out after the world-entry restore
+
+**Issue:** measured in the staging world (fresh second PC, sync on): the raid profiles came back as "Primary" only,
+and five seconds later the proxy uploaded that default over the account's profiles. The server sends
+ACCOUNT_DATA_TIMES right after LOGIN_VERIFY_WORLD (vMaNGOS `CharacterHandler.cpp`); the proxy restores documents at
+ACCOUNT_DATA_TIMES (`LoadAllData`) but sent `SMSG_LOAD_CUF_PROFILES` at LOGIN_VERIFY_WORLD from the local file, which
+a fresh install does not have. The client then created and saved its default.
+**Change:** with account sync on, `HandleLoginVerifyWorld` only marks `GameState.CufLoadAfterAccountSync`, and
+`HandleAccountDataTimes` sends the profiles after `SendAccountDataTimes()` (which runs the restore). Sync off: unchanged.
+**Verification:** staging, fresh pcB, same account state: before (a5841a5/bd2420d) `p2=nil` and `PUT …/cuf/…` from pcB;
+after (269b4a2) `p1=Primary p2=ProbeA`, no PUT, all seven files byte-identical with the first PC.
+
+---
+
 ## 2026-10-02 — Account sync: a re-stamped file is not uploaded again
 
-**Issue:** measured in the staging world (launcher → proxy → 1.14.2 client): the client rewrites chat (type 7) on
-every logout with a new time field and identical content. The proxy compared whole-file hashes, so each logout made
-one more server revision (two uploads one second apart, inflated text byte-identical) and spent the hourly write budget.
+**Issue:** measured in the staging world (launcher → proxy → 1.14.2 client): the client saved chat (type 7) twice,
+one second apart, with a new time field and identical content. The proxy compared whole-file hashes, so the second
+save became one more server revision (inflated text byte-identical) and spent the hourly write budget.
 **Change:** `AccountSyncContainer.ContentSha256` hashes the file with bytes 16-23 zeroed; the journal stores it as
 `contentSha256`, and `AccountSyncDecision.Decide` treats a local file whose content hash equals the journal's as
 unchanged. Every other byte still counts, so a real change is always uploaded. Older journals without the field keep

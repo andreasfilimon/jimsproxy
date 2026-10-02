@@ -33,7 +33,7 @@ The GUID values are unsigned decimal `WowGuid128.GetLowValue()` and `GetHighValu
 
 ## Reconciliation table
 
-`L` is the SHA-256 of the local whole file (or none), `J` is the last-confirmed journal entry (or none), and `R` is the active server head (or none). “Newer” means a different revision id. `L = J` also holds when the two differ only in the container's time field (bytes 16-23): the journal keeps a second hash with that field zeroed (`contentSha256`), because the client re-stamps some files without changing them (chat, type 7, on every logout). A journal entry without `contentSha256` (written before 2026-10-02) compares whole files only.
+`L` is the SHA-256 of the local whole file (or none), `J` is the last-confirmed journal entry (or none), and `R` is the active server head (or none). “Newer” means a different revision id. `L = J` also holds when the two differ only in the container's time field (bytes 16-23): the journal keeps a second hash with that field zeroed (`contentSha256`), because the client re-stamps some files without changing them (chat, type 7: two saves one second apart with identical text). A journal entry without `contentSha256` (written before 2026-10-02) compares whole files only.
 
 | L | J | R | Action |
 |---|---|---|---|

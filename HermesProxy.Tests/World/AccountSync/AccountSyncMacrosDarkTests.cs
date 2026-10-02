@@ -59,6 +59,10 @@ public class AccountSyncMacrosDarkTests
     public void MacrosOnlyCapabilityUploadsOnlyMacros()
     {
         string directory = NewDirectory();
+        // Bindings files are present too: with the correct per-family gate they must NOT be uploaded
+        // (the capability says bindings:false). Placebo A (GetMode ignores the family) makes them upload.
+        File.WriteAllBytes(Path.Combine(directory, "data-2.bin"), Container(2));
+        File.WriteAllBytes(Path.Combine(directory, "data-3-2361-0.bin"), Container(3, 2361, 0));
         File.WriteAllBytes(Path.Combine(directory, "data-4.bin"), Container(4));
         File.WriteAllBytes(Path.Combine(directory, "data-5-2361-0.bin"), Container(5, 2361, 0));
         var handler = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath switch
@@ -125,6 +129,13 @@ public class AccountSyncMacrosDarkTests
 
         lock (requested)
             Assert.All(others, key => Assert.Contains(key, requested));
+
+        // The hanging document used its sub-budget and timed out, but its attempt must still be on disk,
+        // so it moves to the back next entry. Placebo B (persist lastAttemptAt only on success) leaves
+        // this at 0 and turns the assertion red.
+        var journal = AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json"));
+        Assert.True(journal.Documents.TryGetValue(K2, out var hung), "the hanging document must be in the journal");
+        Assert.True(hung.LastAttemptAt > 0, "the hanging document must be marked attempted even on timeout");
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────────

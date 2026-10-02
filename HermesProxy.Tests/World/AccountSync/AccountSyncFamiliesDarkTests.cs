@@ -45,6 +45,21 @@ public class AccountSyncFamiliesDarkTests
         OnlyFamilyUploads("config", 0, character: false);
     }
 
+    // ── layout (6 character) ─────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void LayoutStaysDarkInShippedTable()
+    {
+        Assert.False(AccountSyncDescriptors.ForType(6)!.ImplementedByProxy);
+        Assert.Null(AccountSyncKeys.Build("Elwynn", Guid, 6));
+    }
+
+    [Fact]
+    public void LayoutOnlyCapabilityUploadsOnlyLayout()
+    {
+        OnlyFamilyUploads("layout", 6, character: true);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>With the family's switch on and bindings off, only the family's document is uploaded:

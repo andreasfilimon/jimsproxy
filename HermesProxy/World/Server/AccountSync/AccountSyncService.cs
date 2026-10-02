@@ -69,8 +69,8 @@ public sealed class AccountSyncService : IDisposable
     public void ReconcileAtWorldEntry(string directory, string realmName, WowGuid128 guid)
     {
         if (!IsEnabled) return;
-        var firstImplemented = _descriptors.FirstOrDefault(d => d.ImplementedByProxy && d.Type is not null);
-        if (firstImplemented is null || AccountSyncKeys.Build(realmName, guid, firstImplemented.Type!.Value, _descriptors) == null)
+        var firstImplemented = _descriptors.FirstOrDefault(d => d.ImplementedByProxy);
+        if (firstImplemented is null || AccountSyncKeys.Build(realmName, guid, firstImplemented) == null)
             return;
         using var budget = new CancellationTokenSource(FetchBudget);
         try
@@ -88,13 +88,20 @@ public sealed class AccountSyncService : IDisposable
         }
     }
 
-    /// <summary>Queues a saved type 2/3 file without blocking its packet handler.</summary>
-    public void EnqueueSaved(string directory, string realmName, WowGuid128 guid, uint type)
+    /// <summary>Queues a saved container document (AccountData type) without blocking its packet handler.</summary>
+    public void EnqueueSaved(string directory, string realmName, WowGuid128 guid, uint type) =>
+        EnqueueSaved(directory, realmName, guid, _descriptors.FirstOrDefault(d => d.Type == type));
+
+    /// <summary>Queues the saved RawCuf document (no AccountData type) without blocking its packet handler.</summary>
+    public void EnqueueSavedCuf(string directory, string realmName, WowGuid128 guid) =>
+        EnqueueSaved(directory, realmName, guid, _descriptors.FirstOrDefault(d => d.Family == "cuf"));
+
+    private void EnqueueSaved(string directory, string realmName, WowGuid128 guid, AccountSyncDescriptor? descriptor)
     {
-        if (!IsEnabled) return;
-        string? key = AccountSyncKeys.Build(realmName, guid, type, _descriptors);
+        if (!IsEnabled || descriptor is null || !descriptor.ImplementedByProxy) return;
+        string? key = AccountSyncKeys.Build(realmName, guid, descriptor);
         if (key == null) return;
-        Queue(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow + Debounce));
+        Queue(NewPendingUpload(directory, realmName, guid, descriptor, key, _clock.UtcNow + Debounce));
     }
 
     /// <summary>Flushes currently pending uploads within the caller's total budget.</summary>
@@ -138,9 +145,10 @@ public sealed class AccountSyncService : IDisposable
     internal async Task ReconcileUploadForTestAsync(string directory, string realmName, WowGuid128 guid, uint type,
         CancellationToken cancellationToken = default)
     {
-        string? key = AccountSyncKeys.Build(realmName, guid, type, _descriptors);
-        if (!IsEnabled || key == null) return;
-        await ReconcileUploadAsync(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow), cancellationToken);
+        var descriptor = _descriptors.FirstOrDefault(d => d.Type == type);
+        string? key = AccountSyncKeys.Build(realmName, guid, descriptor);
+        if (!IsEnabled || descriptor is null || key == null) return;
+        await ReconcileUploadAsync(NewPendingUpload(directory, realmName, guid, descriptor, key, _clock.UtcNow), cancellationToken);
     }
 
     internal async Task ReconcileAtWorldEntryAsync(string directory, string realmName, WowGuid128 guid, CancellationToken token)
@@ -153,7 +161,7 @@ public sealed class AccountSyncService : IDisposable
             // One pass over the proxy-implemented descriptors, each with its own switch family. In the
             // shipped table that is bindings only; a test table can turn a family on (N1.2).
             var enabled = _descriptors
-                .Where(d => d.ImplementedByProxy && d.Type is not null)
+                .Where(d => d.ImplementedByProxy)
                 .Where(d => capabilities.GetMode(d.SwitchFamily) != AccountSyncMode.Off)
                 .ToArray();
             if (enabled.Length == 0) return;
@@ -166,7 +174,7 @@ public sealed class AccountSyncService : IDisposable
             // bindings first, then the rest by lastAttemptAt ascending: a document that ran out of its
             // own sub-budget moves to the back on the next world entry (plan §5 P2.4).
             var ordered = enabled
-                .Select(d => (Descriptor: d, Key: AccountSyncKeys.Build(realmName, guid, d.Type!.Value, _descriptors)!))
+                .Select(d => (Descriptor: d, Key: AccountSyncKeys.Build(realmName, guid, d)!))
                 .OrderByDescending(x => x.Descriptor.SwitchFamily == "bindings")
                 .ThenBy(x => journal.Attempts.TryGetValue(x.Key, out long attemptedAt) ? attemptedAt : 0)
                 .ToArray();
@@ -174,7 +182,6 @@ public sealed class AccountSyncService : IDisposable
             foreach (var (descriptor, key) in ordered)
             {
                 if (token.IsCancellationRequested) break;
-                uint type = descriptor.Type!.Value;
                 AccountSyncMode mode = capabilities.GetMode(descriptor.SwitchFamily);
                 // Mark the attempt before the network, so a timeout still moves this document back next time.
                 MarkAttempt(journal, key);
@@ -200,7 +207,7 @@ public sealed class AccountSyncService : IDisposable
                         case AccountSyncAction.UploadCreate:
                         case AccountSyncAction.UploadMatch:
                         case AccountSyncAction.ConflictCandidate:
-                            Queue(NewPendingUpload(directory, realmName, guid, type, key, _clock.UtcNow));
+                            Queue(NewPendingUpload(directory, realmName, guid, descriptor, key, _clock.UtcNow));
                             break;
                         case AccountSyncAction.ConflictBlocked:
                             Log.Print(LogType.Warn, "account sync: remote document conflict awaits launcher resolution");
@@ -249,7 +256,7 @@ public sealed class AccountSyncService : IDisposable
         if (document.Revision != remote.Revision || payload.Length != document.ByteLength || payload.Length != remote.ByteLength ||
             !string.Equals(AccountSyncContainer.Sha256(payload), remote.Sha256, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(document.Sha256, remote.Sha256, StringComparison.OrdinalIgnoreCase) ||
-            !AccountSyncContainer.Validate(payload, descriptor.Type!.Value, guid, descriptor.IsCharacter, descriptor.MaxBytes))
+            !IsValidPayload(descriptor, payload, guid))
             throw new InvalidDataException("invalid remote payload");
 
         string temp = file + ".sync.tmp";
@@ -322,12 +329,12 @@ public sealed class AccountSyncService : IDisposable
         await gate.WaitAsync(outerToken);
         try
         {
-            var descriptor = AccountSyncDescriptors.ForType(pending.Type, _descriptors);
-            if (descriptor is null || !descriptor.ImplementedByProxy) return;
+            AccountSyncDescriptor descriptor = pending.Descriptor;
+            if (!descriptor.ImplementedByProxy) return;
             string file = GetFilePath(pending.Directory, pending.Guid, descriptor);
             if (!File.Exists(file)) return;
             byte[] payload = await File.ReadAllBytesAsync(file, outerToken);
-            if (!AccountSyncContainer.Validate(payload, pending.Type, pending.Guid, descriptor.IsCharacter, descriptor.MaxBytes)) return;
+            if (!IsValidPayload(descriptor, payload, pending.Guid)) return;
             string hash = AccountSyncContainer.Sha256(payload);
 
             var capabilities = await _client.GetCapabilitiesAsync(outerToken);
@@ -429,9 +436,16 @@ public sealed class AccountSyncService : IDisposable
         _signals.Writer.TryWrite(identity);
     }
 
-    private static PendingUpload NewPendingUpload(string directory, string realmName, WowGuid128 guid, uint type,
-        string key, DateTimeOffset due) => new(
-        directory, realmName, guid, type, key, due, 0, System.Guid.NewGuid().ToString("D"));
+    private static PendingUpload NewPendingUpload(string directory, string realmName, WowGuid128 guid,
+        AccountSyncDescriptor descriptor, string key, DateTimeOffset due) => new(
+        directory, realmName, guid, descriptor, key, due, 0, System.Guid.NewGuid().ToString("D"));
+
+    /// <summary>The payload check of a document, by its format: the 36-byte container, or the raw CUF
+    /// block's structure (P5). One place, so restore and upload cannot disagree.</summary>
+    private static bool IsValidPayload(AccountSyncDescriptor descriptor, byte[] payload, WowGuid128 guid) =>
+        descriptor.Format == AccountSyncFormat.RawCuf
+            ? RawCufValidator.Validate(payload, descriptor.MaxBytes)
+            : AccountSyncContainer.Validate(payload, descriptor.Type!.Value, guid, descriptor.IsCharacter, descriptor.MaxBytes);
 
     private void QueueRetry(PendingUpload pending)
     {
@@ -528,6 +542,6 @@ public sealed class AccountSyncService : IDisposable
         _ownedHttp?.Dispose();
     }
 
-    private sealed record PendingUpload(string Directory, string RealmName, WowGuid128 Guid, uint Type, string Key,
+    private sealed record PendingUpload(string Directory, string RealmName, WowGuid128 Guid, AccountSyncDescriptor Descriptor, string Key,
         DateTimeOffset Due, int RetryAttempt, string ClientUploadId);
 }

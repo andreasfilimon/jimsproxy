@@ -547,28 +547,48 @@ public class AccountDataManager
     public byte[] LoadCUFProfiles()
     {
         string fileName = Path.Combine(GetAccountDataDirectory(), "cuf.bin");
-
+        // ACCOUNT-SYNC: a save still waiting for the lock is the newest state of this file (P5).
+        if (AccountSync.AccountSyncDeferredSaves.IsPending(fileName))
+            fileName = AccountSync.AccountSyncDeferredSaves.PathFor(fileName);
         if (File.Exists(fileName))
-        {
-            using (FileStream file = File.OpenRead(fileName))
-            {
-                using (BinaryReader reader = new BinaryReader(file))
-                {
-                    return File.ReadAllBytes(fileName);
-                }
-            }
-        }
+            return File.ReadAllBytes(fileName);
 
         return new byte[4];
     }
 
     public void SaveCUFProfiles(byte[] data)
     {
-        string fileName = Path.Combine(GetAccountDataDirectory(), "cuf.bin");
-
-        using (BinaryWriter writer = new BinaryWriter(File.Open(fileName, FileMode.Create)))
+        if (data == null)
+            return;
+        string finalPath = Path.Combine(GetAccountDataDirectory(), "cuf.bin");
+        string tempPath = finalPath + ".tmp";
+        // ACCOUNT-SYNC: a CUF save takes the same sequence + lock + defer path as SaveData, so a crash
+        // between write and move cannot lose it and the launcher never sees a half file (P5).
+        long sequence = AccountSync.AccountSyncDeferredSaves.NextSequence();
+        string directory = GetAccountDataDirectory();
+        using (var held = AccountSync.AccountSyncDirectoryLock.Enter(directory, AccountSync.AccountSyncDirectoryLock.SaveWait))
         {
-            writer.Write(data);
+            if (!held.HasFileLock)
+            {
+                Log.Print(LogType.Warn, "account sync: the AccountData lock stayed busy, the CUF save is written as soon as it frees");
+                AccountSync.AccountSyncDeferredSaves.Defer(finalPath, data, sequence,
+                    () => AccountSync.AccountSyncRuntime.Service?.EnqueueSavedCuf(directory, _realmName, default));
+                return;
+            }
+            if (!AccountSync.AccountSyncDeferredSaves.Claim(finalPath, sequence))
+                return; // a later save of this file is already written
+            try
+            {
+                File.WriteAllBytes(tempPath, data);
+                File.Move(tempPath, finalPath, overwrite: true);
+                AccountSync.AccountSyncDeferredSaves.Supersede(finalPath, sequence);
+            }
+            finally
+            {
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+            }
         }
+
+        AccountSync.AccountSyncRuntime.Service?.EnqueueSavedCuf(directory, _realmName, default);
     }
 }

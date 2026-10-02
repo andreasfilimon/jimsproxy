@@ -16,12 +16,16 @@ public static class AccountSyncKeys
     /// The family, scope and type segment come from the descriptor table, never a switch. The optional
     /// table lets tests run with a family turned on (N1.2); the default is the shipped table.</summary>
     public static string? Build(string realmName, WowGuid128 guid, uint type,
-        IReadOnlyList<AccountSyncDescriptor>? descriptors = null)
+        IReadOnlyList<AccountSyncDescriptor>? descriptors = null) =>
+        Build(realmName, guid, AccountSyncDescriptors.ForType(type, descriptors));
+
+    /// <summary>Builds the canonical key from a descriptor, so a document without an AccountData type
+    /// (the RawCuf document) is addressed the same way as a container document (P5).</summary>
+    public static string? Build(string realmName, WowGuid128 guid, AccountSyncDescriptor? descriptor)
     {
-        if (!RealmSlugs.TryGetValue(realmName.Trim(), out string? slug))
-            return null;
-        var descriptor = AccountSyncDescriptors.ForType(type, descriptors);
         if (descriptor is null || !descriptor.ImplementedByProxy)
+            return null;
+        if (!RealmSlugs.TryGetValue(realmName.Trim(), out string? slug))
             return null;
         return descriptor.IsCharacter
             ? $"v1/{AccountSyncDescriptors.Flavor}/{descriptor.Family}/character/{slug}/{guid.GetLowValue()}-{guid.GetHighValue()}/{descriptor.TypeSegment}"

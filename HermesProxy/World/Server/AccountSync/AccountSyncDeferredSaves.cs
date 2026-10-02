@@ -157,7 +157,8 @@ public static class AccountSyncDeferredSaves
             if (IsPending(finalPath)) continue;
             // The temp file was being written after the .deferred it would have replaced: prefer it when whole.
             var candidates = group.OrderBy(f => f.EndsWith(TempSuffix, StringComparison.Ordinal) ? 0 : 1).ToList();
-            string? winner = candidates.FirstOrDefault(IsWholeContainer);
+            var descriptor = AccountSyncDescriptors.ForFileName(Path.GetFileName(finalPath));
+            string? winner = candidates.FirstOrDefault(f => IsWhole(descriptor, f));
             if (winner != null)
             {
                 if (File.Exists(finalPath)) File.Copy(finalPath, BackupPath(directory, finalPath, ms++, ""));
@@ -168,6 +169,23 @@ public static class AccountSyncDeferredSaves
             foreach (string rest in candidates.Where(f => f != winner && File.Exists(f)))
                 File.Move(rest, BackupPath(directory, finalPath, ms++, rest.EndsWith(TempSuffix, StringComparison.Ordinal) ? ".deferred-tmp" : ".deferred"));
         }
+    }
+
+    /// <summary>Whether a leftover file is a complete write of its document: the container header checks
+    /// out, or the raw CUF block passes its structure check. The document is told by its target name
+    /// (<c>cuf.bin</c> → RawCuf, <c>data-*.bin</c> → Container), so a crash during a CUF save is treated
+    /// like any other (P5).</summary>
+    internal static bool IsWhole(AccountSyncDescriptor? descriptor, string path) =>
+        descriptor?.Format == AccountSyncFormat.RawCuf ? IsWholeCuf(path) : IsWholeContainer(path);
+
+    private static bool IsWholeCuf(string path)
+    {
+        try
+        {
+            byte[] bytes = File.ReadAllBytes(path);
+            return RawCufValidator.Validate(bytes, RawCufValidator.PacketMaxBytes);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
     }
 
     /// <summary>The 36-byte header's compressed length matches the file length: a write that finished.</summary>

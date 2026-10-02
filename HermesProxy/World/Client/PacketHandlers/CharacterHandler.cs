@@ -371,9 +371,21 @@ public partial class WorldClient
         GetSession().GameState.PendingDeferredTransportSynth =
             DeferredTransportSynthMode.Login;
 
-        LoadCUFProfiles cuf = new();
-        cuf.Data = GetSession().AccountDataMgr.LoadCUFProfiles();
-        SendPacketToClient(cuf);
+        // ACCOUNT-SYNC: the server sends ACCOUNT_DATA_TIMES right after LOGIN_VERIFY_WORLD, and only then does
+        // the proxy restore the account's documents (LoadAllData). Sending the CUF profiles here would send the
+        // local file before cuf.bin is restored: a fresh install has none, the client creates "Primary" and saves
+        // it, and that save replaces the account's profiles (measured 2026-10-02 in the staging world). With sync
+        // on, the profiles follow ACCOUNT_DATA_TIMES instead (MiscHandler.HandleAccountDataTimes).
+        if (HermesProxy.World.Server.AccountSync.AccountSyncRuntime.Service?.IsEnabled == true)
+        {
+            GetSession().GameState.CufLoadAfterAccountSync = true;
+        }
+        else
+        {
+            LoadCUFProfiles cuf = new();
+            cuf.Data = GetSession().AccountDataMgr.LoadCUFProfiles();
+            SendPacketToClient(cuf);
+        }
     }
 
     [PacketHandler(Opcode.SMSG_CHARACTER_LOGIN_FAILED)]

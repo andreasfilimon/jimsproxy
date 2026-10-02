@@ -410,6 +410,11 @@ public sealed class GameSessionData
     // once it fires or skips.
     public DeferredTransportSynthMode PendingDeferredTransportSynth;
 
+    // ACCOUNT-SYNC: set at LOGIN_VERIFY_WORLD when account sync is on. The CUF profiles are then sent after
+    // ACCOUNT_DATA_TIMES, once LoadAllData restored cuf.bin (WorldClient.HandleAccountDataTimes). Decided at
+    // login, so an authorization failure during the restore cannot leave the client without its profiles.
+    public bool CufLoadAfterAccountSync;
+
     public bool IsFirstEnterWorld;
     public bool IsConnectedToInstance;
     public Queue<ServerPacket> PendingUninstancedPackets = new(); // Here packets are queued while IsConnectedToInstance = false;

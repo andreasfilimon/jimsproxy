@@ -34,6 +34,15 @@ public partial class WorldClient
     {
         GetSession().RealmSocket.SendAccountDataTimes();
 
+        // ACCOUNT-SYNC: the CUF profiles held back at LOGIN_VERIFY_WORLD, now that LoadAllData restored cuf.bin.
+        if (GetSession().GameState.CufLoadAfterAccountSync)
+        {
+            GetSession().GameState.CufLoadAfterAccountSync = false;
+            LoadCUFProfiles cuf = new();
+            cuf.Data = GetSession().AccountDataMgr.LoadCUFProfiles();
+            SendPacketToClient(cuf);
+        }
+
         // These packets don't exist in Vanilla and we must send them here.
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
         {

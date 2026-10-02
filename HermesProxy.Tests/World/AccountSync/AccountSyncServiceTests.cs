@@ -64,9 +64,10 @@ public class AccountSyncServiceTests
 
         Assert.False(File.Exists(Path.Combine(directory, "data-2.bin")));
         // P2 records the attempt before the network (fairness, plan §5 P2.4), so the journal may exist,
-        // but it must never hold a confirmed revision for a payload that failed its hash.
+        // but the failed hash must never become a confirmed revision (K2 B1: attempts are kept apart).
         var journal = AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json"));
-        Assert.All(journal.Documents.Values, entry => Assert.Equal("", entry.Revision));
+        Assert.Empty(journal.Documents);
+        Assert.True(journal.Attempts.ContainsKey(Key), "the attempt is recorded");
     }
 
     [Fact]

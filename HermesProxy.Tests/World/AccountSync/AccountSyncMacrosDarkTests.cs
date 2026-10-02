@@ -85,10 +85,10 @@ public class AccountSyncMacrosDarkTests
     [Fact]
     public void CharacterTypeWithWrongGuidIsRejected()
     {
-        Assert.False(AccountSyncContainer.Validate(Container(5, 999, 0), 5, Guid, AccountSyncContainer.MaxFileSize, requireGuidMatch: true));
-        Assert.True(AccountSyncContainer.Validate(Container(5, 2361, 0), 5, Guid, AccountSyncContainer.MaxFileSize, requireGuidMatch: true));
+        Assert.False(AccountSyncContainer.Validate(Container(5, 999, 0), 5, Guid, requireGuidMatch: true, maxFileSize: AccountSyncContainer.MaxFileSize));
+        Assert.True(AccountSyncContainer.Validate(Container(5, 2361, 0), 5, Guid, requireGuidMatch: true, maxFileSize: AccountSyncContainer.MaxFileSize));
         // Account-scope documents carry no GUID check.
-        Assert.True(AccountSyncContainer.Validate(Container(4), 4, Guid, AccountSyncContainer.MaxFileSize, requireGuidMatch: false));
+        Assert.True(AccountSyncContainer.Validate(Container(4), 4, Guid, requireGuidMatch: false, maxFileSize: AccountSyncContainer.MaxFileSize));
     }
 
     [Fact]
@@ -131,11 +131,43 @@ public class AccountSyncMacrosDarkTests
             Assert.All(others, key => Assert.Contains(key, requested));
 
         // The hanging document used its sub-budget and timed out, but its attempt must still be on disk,
-        // so it moves to the back next entry. Placebo B (persist lastAttemptAt only on success) leaves
-        // this at 0 and turns the assertion red.
+        // so it moves to the back next entry. Placebo B (persist the attempt only on success) leaves
+        // this at 0 and turns the assertion red. B1: the attempt lives in Attempts, never in Documents.
         var journal = AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json"));
-        Assert.True(journal.Documents.TryGetValue(K2, out var hung), "the hanging document must be in the journal");
-        Assert.True(hung.LastAttemptAt > 0, "the hanging document must be marked attempted even on timeout");
+        Assert.True(journal.Attempts.TryGetValue(K2, out long hungAt), "the hanging document must be marked attempted");
+        Assert.True(hungAt > 0, "the hanging document must be marked attempted even on timeout");
+        Assert.DoesNotContain(K2, journal.Documents.Keys);
+    }
+
+    /// <summary>K2 B1: recording an attempt must never create a confirmed-revision entry. With a local
+    /// file and a remote document of a different hash, the world entry decides ConflictCandidate, and
+    /// Documents stays empty because nothing was confirmed. Placebo: putting the attempt back into
+    /// Documents turns the DoesNotContain red.</summary>
+    [Fact]
+    public void AttemptMarkIsNotAConfirmedRevision()
+    {
+        string directory = NewDirectory();
+        File.WriteAllBytes(Path.Combine(directory, "data-2.bin"), Container(2));
+        byte[] remotePayload = Container(2, 111, 222);
+        using var conflictPosted = new ManualResetEventSlim();
+        var handler = new FakeHandler((request, _) =>
+        {
+            string path = request.RequestUri!.AbsolutePath;
+            if (path.EndsWith("/capabilities")) return Task.FromResult(Json(Capabilities("{\"bindings\":true}")));
+            if (path.EndsWith("/documents"))
+                return Task.FromResult(Json(Documents(new Dictionary<string, byte[]> { [K2] = remotePayload })));
+            if (path.EndsWith("/conflict-candidates")) conflictPosted.Set();
+            return Task.FromResult(Json("{}"));
+        });
+        using var service = new AccountSyncService(Options(), new HttpClient(handler));
+
+        service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
+
+        bool posted = conflictPosted.Wait(TimeSpan.FromSeconds(3));
+        Assert.True(posted, "the different local copy is posted as a conflict candidate; requests: " + string.Join(", ", handler.Requests.Select(r => r.Method + " " + r.Path)));
+        var journal = AccountSyncJournal.Load(Path.Combine(directory, "sync-journal.json"));
+        Assert.True(journal.Attempts.TryGetValue(K2, out long attemptedAt) && attemptedAt > 0, "the attempt is recorded");
+        Assert.DoesNotContain(K2, journal.Documents.Keys);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────────

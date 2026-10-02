@@ -12,9 +12,16 @@ public sealed class AccountSyncJournal
     [JsonPropertyName("version")]
     public int Version { get; set; } = 1;
 
-    /// <summary>Entries indexed by canonical document key.</summary>
+    /// <summary>Last-confirmed remote revisions, indexed by canonical document key. Only ever holds a
+    /// revision the server confirmed; a mere attempt never appears here (K2 B1).</summary>
     [JsonPropertyName("documents")]
     public Dictionary<string, AccountSyncJournalEntry> Documents { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>Unix milliseconds of the last reconciliation attempt per document key, 0/absent when
+    /// never attempted. Kept apart from <see cref="Documents"/> so the decision table never mistakes an
+    /// attempt for a confirmed revision (K2 B1). An older proxy ignores this field.</summary>
+    [JsonPropertyName("attempts")]
+    public Dictionary<string, long> Attempts { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>Reads a valid v1 journal, returning an empty journal for missing or invalid input.</summary>
     public static AccountSyncJournal Load(string path)
@@ -23,7 +30,9 @@ public sealed class AccountSyncJournal
         {
             if (!File.Exists(path)) return new();
             var journal = JsonSerializer.Deserialize<AccountSyncJournal>(File.ReadAllBytes(path), JsonOptions);
-            return journal is { Version: 1, Documents: not null } ? journal : new();
+            if (journal is not { Version: 1, Documents: not null }) return new();
+            journal.Attempts ??= new(StringComparer.Ordinal);
+            return journal;
         }
         catch
         {
@@ -65,8 +74,4 @@ public sealed class AccountSyncJournalEntry
     public string Revision { get; set; } = "";
     [JsonPropertyName("sha256")]
     public string Sha256 { get; set; } = "";
-    /// <summary>Unix milliseconds of the last reconciliation attempt, 0 when never attempted. Written
-    /// before the network so a hanging document moves to the back of the fairness order (plan §5 P2.4).</summary>
-    [JsonPropertyName("lastAttemptAt")]
-    public long LastAttemptAt { get; set; }
 }

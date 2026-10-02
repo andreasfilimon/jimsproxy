@@ -13,18 +13,18 @@ public class AccountSyncContainerTests
 
     [Fact]
     public void Validate_RealType2File_Accepts() =>
-        Assert.True(AccountSyncContainer.Validate(RealData, 2, default));
+        Assert.True(AccountSyncContainer.Validate(RealData, 2, default, requireGuidMatch: false));
 
     [Fact]
     public void Validate_WrongType_Rejects() =>
-        Assert.False(AccountSyncContainer.Validate(RealData, 3, new WowGuid128(2361, 0)));
+        Assert.False(AccountSyncContainer.Validate(RealData, 3, new WowGuid128(2361, 0), requireGuidMatch: true));
 
     [Fact]
     public void Validate_Type3WrongGuid_Rejects()
     {
         byte[] bytes = (byte[])RealData.Clone();
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(24), 3);
-        Assert.False(AccountSyncContainer.Validate(bytes, 3, new WowGuid128(1, 2)));
+        Assert.False(AccountSyncContainer.Validate(bytes, 3, new WowGuid128(1, 2), requireGuidMatch: true));
     }
 
     [Fact]
@@ -32,6 +32,6 @@ public class AccountSyncContainerTests
     {
         byte[] bytes = (byte[])RealData.Clone();
         BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(32), 1);
-        Assert.False(AccountSyncContainer.Validate(bytes, 2, default));
+        Assert.False(AccountSyncContainer.Validate(bytes, 2, default, requireGuidMatch: false));
     }
 }

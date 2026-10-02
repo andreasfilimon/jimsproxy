@@ -168,7 +168,7 @@ public sealed class AccountSyncService : IDisposable
             var ordered = enabled
                 .Select(d => (Descriptor: d, Key: AccountSyncKeys.Build(realmName, guid, d.Type!.Value, _descriptors)!))
                 .OrderByDescending(x => x.Descriptor.SwitchFamily == "bindings")
-                .ThenBy(x => journal.Documents.TryGetValue(x.Key, out var entry) ? entry.LastAttemptAt : 0)
+                .ThenBy(x => journal.Attempts.TryGetValue(x.Key, out long attemptedAt) ? attemptedAt : 0)
                 .ToArray();
 
             foreach (var (descriptor, key) in ordered)
@@ -224,16 +224,12 @@ public sealed class AccountSyncService : IDisposable
         }
     }
 
-    /// <summary>Marks a document as attempted-now, keeping its last confirmed revision/hash.</summary>
+    /// <summary>Marks a document as attempted-now. The attempt lives in <see cref="AccountSyncJournal.Attempts"/>,
+    /// never in <see cref="AccountSyncJournal.Documents"/>: the decision table must keep seeing "no confirmed
+    /// revision" until the server actually confirmed one (K2 B1).</summary>
     private void MarkAttempt(AccountSyncJournal journal, string key)
     {
-        journal.Documents.TryGetValue(key, out var entry);
-        journal.Documents[key] = new AccountSyncJournalEntry
-        {
-            Revision = entry?.Revision ?? "",
-            Sha256 = entry?.Sha256 ?? "",
-            LastAttemptAt = _clock.UtcNow.ToUnixTimeMilliseconds(),
-        };
+        journal.Attempts[key] = _clock.UtcNow.ToUnixTimeMilliseconds();
     }
 
     private static void TryPersistJournal(AccountSyncJournal journal, string journalPath, CancellationToken token)
@@ -253,7 +249,7 @@ public sealed class AccountSyncService : IDisposable
         if (document.Revision != remote.Revision || payload.Length != document.ByteLength || payload.Length != remote.ByteLength ||
             !string.Equals(AccountSyncContainer.Sha256(payload), remote.Sha256, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(document.Sha256, remote.Sha256, StringComparison.OrdinalIgnoreCase) ||
-            !AccountSyncContainer.Validate(payload, descriptor.Type!.Value, guid, descriptor.MaxBytes, descriptor.IsCharacter))
+            !AccountSyncContainer.Validate(payload, descriptor.Type!.Value, guid, descriptor.IsCharacter, descriptor.MaxBytes))
             throw new InvalidDataException("invalid remote payload");
 
         string temp = file + ".sync.tmp";
@@ -331,7 +327,7 @@ public sealed class AccountSyncService : IDisposable
             string file = GetFilePath(pending.Directory, pending.Guid, descriptor);
             if (!File.Exists(file)) return;
             byte[] payload = await File.ReadAllBytesAsync(file, outerToken);
-            if (!AccountSyncContainer.Validate(payload, pending.Type, pending.Guid, descriptor.MaxBytes, descriptor.IsCharacter)) return;
+            if (!AccountSyncContainer.Validate(payload, pending.Type, pending.Guid, descriptor.IsCharacter, descriptor.MaxBytes)) return;
             string hash = AccountSyncContainer.Sha256(payload);
 
             var capabilities = await _client.GetCapabilitiesAsync(outerToken);
@@ -415,15 +411,14 @@ public sealed class AccountSyncService : IDisposable
         journal.SaveWithinBudget(path, token);
     }
 
-    /// <summary>Writes revision/hash for a key while keeping its lastAttemptAt (the fairness ordering).</summary>
+    /// <summary>Writes the confirmed revision/hash for a key. The attempt timestamp stays in
+    /// <see cref="AccountSyncJournal.Attempts"/>, untouched by this.</summary>
     private static void UpdateEntry(AccountSyncJournal journal, string key, string revision, string sha256)
     {
-        journal.Documents.TryGetValue(key, out var prior);
         journal.Documents[key] = new AccountSyncJournalEntry
         {
             Revision = revision,
             Sha256 = sha256,
-            LastAttemptAt = prior?.LastAttemptAt ?? 0,
         };
     }
 

@@ -92,6 +92,23 @@ public class AccountSyncFamiliesDarkTests
         OnlyFamilyUploads("tts", 8, character: false);
     }
 
+    // ── flagged (10 account / 11 character) ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public void FlaggedStaysDarkInShippedTable()
+    {
+        Assert.False(AccountSyncDescriptors.ForType(10)!.ImplementedByProxy);
+        Assert.False(AccountSyncDescriptors.ForType(11)!.ImplementedByProxy);
+        Assert.Null(AccountSyncKeys.Build("Elwynn", Guid, 10));
+        Assert.Null(AccountSyncKeys.Build("Elwynn", Guid, 11));
+    }
+
+    [Fact]
+    public void FlaggedOnlyCapabilityUploadsOnlyFlagged()
+    {
+        OnlyFamilyUploads("flagged", 10, character: false);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>With the family's switch on and bindings off, only the family's document is uploaded:

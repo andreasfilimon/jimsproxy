@@ -13,6 +13,20 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-03 — Shutdown hooks: SIGTERM really runs them (account-sync flush, final JSONL event)
+
+**Issue:** measured in the staging world: the launcher stops the proxy with SIGTERM after the game ends ("exited
+cleanly after SIGTERM", 12 ms), yet uploads waiting for a retry were never sent, and no session log of the last
+dozen sessions carried a final `process.signal`/`process.exit` event. `ShutdownHooks` created its
+`PosixSignalRegistration`s without holding them; the GC finalizes them, which unregisters the handlers. Measured with a
+Release probe on .NET 10: unheld → `SigCgt` without SIGHUP, SIGTERM exits 143, neither the handler nor ProcessExit
+runs; held → handler runs, exit code from the handler.
+**Change:** `ShutdownHooks` keeps both registrations in static fields.
+**Verification:** `ShutdownHooksTests.PosixHandlers_SurviveGarbageCollection` (after three GCs SIGHUP is still caught,
+read from `/proc/self/status`); placebo (SIGHUP registration unheld) turns it red. Staging rerun in the acceptance report.
+
+---
+
 ## 2026-10-02 — Account sync: CUF profiles go out after the world-entry restore
 
 **Issue:** measured in the staging world (fresh second PC, sync on): the raid profiles came back as "Primary" only,

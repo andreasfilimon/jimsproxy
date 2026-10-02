@@ -18,6 +18,16 @@ internal static class ShutdownHooks
     // Rooted to keep the unmanaged callback alive for the lifetime of the process.
     private static ConsoleCtrlDelegate? _consoleCtrlHandler;
 
+    // Rooted for the same reason: a PosixSignalRegistration nobody holds is finalized by the GC, which
+    // unregisters the handler. SIGTERM then ends the process with 143 and neither this hook nor
+    // ProcessExit runs, so the account-sync flush and the final JSONL event were lost on every stop by
+    // the launcher (measured 2026-10-02: SigCgt without SIGHUP, no final event in any session log).
+    private static PosixSignalRegistration? _sigtermRegistration;
+    private static PosixSignalRegistration? _sighupRegistration;
+
+    /// <summary>Tests only: both POSIX registrations are still held.</summary>
+    internal static bool PosixRegistrationsHeld => _sigtermRegistration is not null && _sighupRegistration is not null;
+
     public static void Install()
     {
         if (Interlocked.Exchange(ref _installed, 1) != 0)
@@ -36,8 +46,8 @@ internal static class ShutdownHooks
         {
             // Linux/macOS: SIGTERM (kill, container stop) and SIGHUP (terminal closed).
             // SIGINT is already covered by Console.CancelKeyPress.
-            PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => OnPosixSignal(ctx, "sigterm"));
-            PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => OnPosixSignal(ctx, "sighup"));
+            _sigtermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => OnPosixSignal(ctx, "sigterm"));
+            _sighupRegistration = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => OnPosixSignal(ctx, "sighup"));
         }
     }
 

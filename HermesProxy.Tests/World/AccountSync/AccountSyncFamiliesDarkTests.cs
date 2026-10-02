@@ -60,6 +60,21 @@ public class AccountSyncFamiliesDarkTests
         OnlyFamilyUploads("layout", 6, character: true);
     }
 
+    // ── chat (7 character) ───────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void ChatStaysDarkInShippedTable()
+    {
+        Assert.False(AccountSyncDescriptors.ForType(7)!.ImplementedByProxy);
+        Assert.Null(AccountSyncKeys.Build("Elwynn", Guid, 7));
+    }
+
+    [Fact]
+    public void ChatOnlyCapabilityUploadsOnlyChat()
+    {
+        OnlyFamilyUploads("chat", 7, character: true);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>With the family's switch on and bindings off, only the family's document is uploaded:

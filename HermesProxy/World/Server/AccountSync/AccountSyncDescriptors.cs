@@ -40,8 +40,8 @@ public sealed record AccountSyncDescriptor(
         .Replace("<hi>", high.ToString(CultureInfo.InvariantCulture));
 }
 
-/// <summary>The shared descriptor table. In P1 only bindings 2/3 are implemented by proxy and launcher;
-/// every other row is dormant until its family is released (FREIGABE.json / P4).</summary>
+/// <summary>The shared descriptor table. Released 2026-10-02: bindings, macros, config, chat, cuf (maxBytes from
+/// FREIGABE.json); layout, tts, flagged, clickbindings stay dormant.</summary>
 public static class AccountSyncDescriptors
 {
     public const string Flavor = "classic-era-42597";
@@ -52,18 +52,18 @@ public static class AccountSyncDescriptors
     [
         new("bindings", 2, "account", AccountSyncFormat.Container, "data-2.bin", 128 * 1024, "bindings", true, true),
         new("bindings", 3, "character", AccountSyncFormat.Container, "data-3-<lo>-<hi>.bin", 128 * 1024, "bindings", true, true),
-        new("macros", 4, "account", AccountSyncFormat.Container, "data-4.bin", PlaceholderMaxBytes, "macros", false, false),
-        new("macros", 5, "character", AccountSyncFormat.Container, "data-5-<lo>-<hi>.bin", PlaceholderMaxBytes, "macros", false, false),
-        new("config", 0, "account", AccountSyncFormat.Container, "data-0.bin", PlaceholderMaxBytes, "config", false, false),
-        new("config", 1, "character", AccountSyncFormat.Container, "data-1-<lo>-<hi>.bin", PlaceholderMaxBytes, "config", false, false),
+        new("macros", 4, "account", AccountSyncFormat.Container, "data-4.bin", 65536, "macros", true, true),
+        new("macros", 5, "character", AccountSyncFormat.Container, "data-5-<lo>-<hi>.bin", 16384, "macros", true, true),
+        new("config", 0, "account", AccountSyncFormat.Container, "data-0.bin", 32768, "config", true, true),
+        new("config", 1, "character", AccountSyncFormat.Container, "data-1-<lo>-<hi>.bin", 32768, "config", true, true),
         new("layout", 6, "character", AccountSyncFormat.Container, "data-6-<lo>-<hi>.bin", PlaceholderMaxBytes, "layout", false, false),
-        new("chat", 7, "character", AccountSyncFormat.Container, "data-7-<lo>-<hi>.bin", PlaceholderMaxBytes, "chat", false, false),
+        new("chat", 7, "character", AccountSyncFormat.Container, "data-7-<lo>-<hi>.bin", 16384, "chat", true, true),
         new("tts", 8, "account", AccountSyncFormat.Container, "data-8.bin", PlaceholderMaxBytes, "tts", false, false),
         new("tts", 9, "character", AccountSyncFormat.Container, "data-9-<lo>-<hi>.bin", PlaceholderMaxBytes, "tts", false, false),
         new("flagged", 10, "account", AccountSyncFormat.Container, "data-10.bin", PlaceholderMaxBytes, "flagged", false, false),
         new("flagged", 11, "character", AccountSyncFormat.Container, "data-11-<lo>-<hi>.bin", PlaceholderMaxBytes, "flagged", false, false),
         new("clickbindings", 12, "character", AccountSyncFormat.Container, "data-12-<lo>-<hi>.bin", PlaceholderMaxBytes, "clickbindings", false, false),
-        new("cuf", null, "account", AccountSyncFormat.RawCuf, "cuf.bin", PlaceholderMaxBytes, "cuf", false, false),
+        new("cuf", null, "account", AccountSyncFormat.RawCuf, "cuf.bin", 2048, "cuf", true, true),
     ];
 
     private static readonly FrozenDictionary<uint, AccountSyncDescriptor> ByType =

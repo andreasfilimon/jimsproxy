@@ -15,9 +15,9 @@ using Xunit;
 
 namespace HermesProxy.Tests.World.AccountSync;
 
-/// <summary>P4, the remaining families built dark (N1). The shipped table keeps every family but bindings
-/// off, so the proxy never touches them; the real code path runs with an injected test table where one
-/// family is on (N1.2). Every file is synthetic. Placebo: the family's descriptor row gets the wrong
+/// <summary>P4, the remaining families (N1). Released 2026-10-02: config, chat and cuf are live in the shipped
+/// table; layout, tts, flagged and clickbindings stay off, so the proxy never touches them; the real code path
+/// runs with an injected test table where one family is on (N1.2). Every file is synthetic. Placebo: the family's descriptor row gets the wrong
 /// scope in the shipped table, so the family-on key/validation no longer matches and the test goes red.</summary>
 public class AccountSyncFamiliesDarkTests
 {
@@ -31,12 +31,12 @@ public class AccountSyncFamiliesDarkTests
     // ── config (0 account / 1 character) ─────────────────────────────────────────────────────────────
 
     [Fact]
-    public void ConfigStaysDarkInShippedTable()
+    public void ConfigIsLiveInShippedTable()
     {
-        Assert.False(AccountSyncDescriptors.ForType(0)!.ImplementedByProxy);
-        Assert.False(AccountSyncDescriptors.ForType(1)!.ImplementedByProxy);
-        Assert.Null(AccountSyncKeys.Build("Elwynn", Guid, 0));
-        Assert.Null(AccountSyncKeys.Build("Elwynn", Guid, 1));
+        Assert.True(AccountSyncDescriptors.ForType(0)!.ImplementedByProxy);
+        Assert.True(AccountSyncDescriptors.ForType(1)!.ImplementedByProxy);
+        Assert.Equal("v1/classic-era-42597/config/account/elwynn/-/0", AccountSyncKeys.Build("Elwynn", Guid, 0));
+        Assert.Equal("v1/classic-era-42597/config/character/elwynn/2361-0/1", AccountSyncKeys.Build("Elwynn", Guid, 1));
     }
 
     [Fact]
@@ -63,16 +63,28 @@ public class AccountSyncFamiliesDarkTests
     // ── chat (7 character) ───────────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void ChatStaysDarkInShippedTable()
+    public void ChatIsLiveInShippedTable()
     {
-        Assert.False(AccountSyncDescriptors.ForType(7)!.ImplementedByProxy);
-        Assert.Null(AccountSyncKeys.Build("Elwynn", Guid, 7));
+        Assert.True(AccountSyncDescriptors.ForType(7)!.ImplementedByProxy);
+        Assert.Equal("v1/classic-era-42597/chat/character/elwynn/2361-0/7", AccountSyncKeys.Build("Elwynn", Guid, 7));
     }
 
     [Fact]
     public void ChatOnlyCapabilityUploadsOnlyChat()
     {
         OnlyFamilyUploads("chat", 7, character: true);
+    }
+
+    // ── cuf (RawCuf, no type) ────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void CufIsLiveInShippedTable()
+    {
+        var cuf = AccountSyncDescriptors.All.Single(d => d.Family == "cuf");
+        Assert.True(cuf.ImplementedByProxy);
+        Assert.True(cuf.ImplementedByLauncher);
+        Assert.Equal(2048, cuf.MaxBytes);
+        Assert.Equal("cuf.bin", cuf.FileName);
     }
 
     // ── tts (8 account / 9 character) ────────────────────────────────────────────────────────────────

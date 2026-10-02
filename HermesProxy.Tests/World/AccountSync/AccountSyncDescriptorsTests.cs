@@ -17,9 +17,9 @@ using Xunit;
 namespace HermesProxy.Tests.World.AccountSync;
 
 /// <summary>The shared descriptor table must equal the JSON fixture byte for byte; a drift (e.g. a changed
-/// scope) turns this red in every repo. P1 stays behaviour-neutral: macros stays dormant even when the
-/// server switch enables it. Placebo: setting macros' ImplementedByProxy=true in the table makes
-/// <see cref="MacrosRemainInactiveBeforeP2"/> red.</summary>
+/// scope) turns this red in every repo. Released 2026-10-02: bindings, macros, config, chat, cuf; tts stays
+/// dormant even when the server switch enables it. Placebo: setting tts' ImplementedByProxy=true in the table
+/// makes <see cref="TtsRemainsInactive"/> red.</summary>
 public class AccountSyncDescriptorsTests
 {
     private static readonly WowGuid128 Guid = new(2361, 0);
@@ -56,35 +56,35 @@ public class AccountSyncDescriptorsTests
     }
 
     [Fact]
-    public void OnlyBindingsAreImplementedBeforeP2()
+    public void ReleasedFamiliesAreImplemented()
     {
         var active = AccountSyncDescriptors.All
             .Where(d => d.ImplementedByProxy || d.ImplementedByLauncher)
             .Select(d => $"{d.Family}/{d.TypeSegment}")
             .ToArray();
-        Assert.Equal(new[] { "bindings/2", "bindings/3" }, active);
+        Assert.Equal(new[] { "bindings/2", "bindings/3", "macros/4", "macros/5", "config/0", "config/1", "chat/7", "cuf/-" }, active);
     }
 
     [Fact]
-    public void MacrosRemainInactiveBeforeP2()
+    public void TtsRemainsInactive()
     {
         string directory = NewDirectory();
-        // A valid data-4.bin waits to be uploaded, and the server switch enables macros.
-        File.WriteAllBytes(Path.Combine(directory, "data-4.bin"), Container(4));
+        // A valid data-8.bin waits to be uploaded, and the server switch enables tts (a family that stays dark).
+        File.WriteAllBytes(Path.Combine(directory, "data-8.bin"), Container(8));
         var handler = new FakeHandler(request => request.RequestUri!.AbsolutePath switch
         {
-            var p when p.EndsWith("/capabilities") => Json("{\"mode\":\"on\",\"families\":{\"bindings\":true,\"macros\":true},\"apiVersion\":1}"),
+            var p when p.EndsWith("/capabilities") => Json("{\"mode\":\"on\",\"families\":{\"bindings\":true,\"tts\":true},\"apiVersion\":1}"),
             var p when p.EndsWith("/documents") => Json("{\"documents\":[]}"),
             _ => Json("{\"documents\":[]}"),
         });
         using var service = new AccountSyncService(Options(), new HttpClient(handler));
 
         service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
-        service.EnqueueSaved(directory, "Elwynn", Guid, 4);
+        service.EnqueueSaved(directory, "Elwynn", Guid, 8);
         service.FlushPending(TimeSpan.FromSeconds(2));
 
         Assert.Equal(0, service.PendingCountForTest);
-        Assert.DoesNotContain(handler.Snapshot(), r => r.Path.Contains("macros", StringComparison.Ordinal) || r.Path.Contains("data-4", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Snapshot(), r => r.Path.Contains("tts", StringComparison.Ordinal) || r.Path.Contains("data-8", StringComparison.Ordinal));
     }
 
     private sealed record FixtureFile(string Flavor, List<FixtureRow> Descriptors);

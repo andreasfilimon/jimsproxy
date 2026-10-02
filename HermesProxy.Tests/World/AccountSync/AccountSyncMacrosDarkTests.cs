@@ -16,12 +16,12 @@ using Xunit;
 
 namespace HermesProxy.Tests.World.AccountSync;
 
-/// <summary>P2 macros, built dark (N1). The shipped table keeps only bindings implemented, so no macros
-/// request or upload happens even when the server switch turns macros on. The real code paths run with an
-/// injected test table (N1.2), and every placeholder file is synthetic. Placebo: setting
-/// ImplementedByProxy=true for macros in the shipped table turns <see cref="MacrosStaysDarkInShippedTable"/>
-/// red; making lastAttemptAt persist only on success turns <see cref="HangingDocumentDoesNotStarveOthers"/>
-/// red.</summary>
+/// <summary>P2 macros (N1). Released 2026-10-02: macros is live in the shipped table, so a macros upload
+/// happens when the server switch turns macros on (<see cref="MacrosIsLiveInShippedTable"/>). The real code
+/// paths also run with an injected test table (N1.2), and every placeholder file is synthetic. Placebo:
+/// setting ImplementedByProxy=false for macros in the shipped table turns
+/// <see cref="MacrosIsLiveInShippedTable"/> red; making lastAttemptAt persist only on success turns
+/// <see cref="HangingDocumentDoesNotStarveOthers"/> red.</summary>
 public class AccountSyncMacrosDarkTests
 {
     private static readonly WowGuid128 Guid = new(2361, 0);
@@ -39,20 +39,26 @@ public class AccountSyncMacrosDarkTests
             .ToArray();
 
     [Fact]
-    public void MacrosStaysDarkInShippedTable()
+    public void MacrosIsLiveInShippedTable()
     {
         string directory = NewDirectory();
         File.WriteAllBytes(Path.Combine(directory, "data-4.bin"), Container(4));
-        var handler = new FakeHandler((_, _) => Task.FromResult(Json(Capabilities("{\"bindings\":false,\"macros\":true}"))));
+        var handler = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath switch
+        {
+            var p when p.EndsWith("/capabilities") => Json(Capabilities("{\"bindings\":false,\"macros\":true}")),
+            var p when p.EndsWith("/documents") => Json("{\"documents\":[]}"),
+            var p when p.EndsWith("/4") => Json(Head(K4, Container(4))),
+            _ => Json("{}"),
+        }));
         using var service = new AccountSyncService(Options(), new HttpClient(handler));
 
         service.ReconcileAtWorldEntry(directory, "Elwynn", Guid);
         service.EnqueueSaved(directory, "Elwynn", Guid, 4);
-        service.FlushPending(TimeSpan.FromSeconds(2));
+        service.FlushPending(TimeSpan.FromSeconds(3));
 
         Assert.Equal(0, service.PendingCountForTest);
-        Assert.DoesNotContain(handler.Snapshot(), r => r.Path.Contains("macros", StringComparison.Ordinal));
-        Assert.DoesNotContain(handler.Snapshot(), r => r.Method == HttpMethod.Put);
+        Assert.Contains(handler.Snapshot(), r => r.Method == HttpMethod.Put && r.Path.Contains("/macros/", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Snapshot(), r => r.Path.Contains("/bindings/", StringComparison.Ordinal));
     }
 
     [Fact]

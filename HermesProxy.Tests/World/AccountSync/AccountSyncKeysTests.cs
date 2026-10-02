@@ -23,8 +23,21 @@ public class AccountSyncKeysTests
 
     [Theory]
     [InlineData("Other", 2u)]
-    [InlineData("Elwynn", 1u)]
-    [InlineData("Elwynn", 4u)]
+    [InlineData("Elwynn", 6u)]
+    [InlineData("Elwynn", 8u)]
+    [InlineData("Elwynn", 9u)]
+    [InlineData("Elwynn", 10u)]
+    [InlineData("Elwynn", 11u)]
+    [InlineData("Elwynn", 12u)]
     public void Build_UnsupportedRealmOrType_ReturnsNull(string realm, uint type) =>
         Assert.Null(AccountSyncKeys.Build(realm, Guid, type));
+
+    [Theory]
+    [InlineData(0u, "v1/classic-era-42597/config/account/elwynn/-/0")]
+    [InlineData(1u, "v1/classic-era-42597/config/character/elwynn/42-99/1")]
+    [InlineData(4u, "v1/classic-era-42597/macros/account/elwynn/-/4")]
+    [InlineData(5u, "v1/classic-era-42597/macros/character/elwynn/42-99/5")]
+    [InlineData(7u, "v1/classic-era-42597/chat/character/elwynn/42-99/7")]
+    public void Build_ReleasedFamilies_ReturnTheDescriptorKey(uint type, string expected) =>
+        Assert.Equal(expected, AccountSyncKeys.Build("Elwynn", Guid, type));
 }

@@ -4,17 +4,17 @@
   "descriptors": [
     { "family": "bindings", "type": 2, "scope": "account", "format": "Container", "fileName": "data-2.bin", "maxBytes": 131072, "switchFamily": "bindings", "implementedByProxy": true, "implementedByLauncher": true },
     { "family": "bindings", "type": 3, "scope": "character", "format": "Container", "fileName": "data-3-<lo>-<hi>.bin", "maxBytes": 131072, "switchFamily": "bindings", "implementedByProxy": true, "implementedByLauncher": true },
-    { "family": "macros", "type": 4, "scope": "account", "format": "Container", "fileName": "data-4.bin", "maxBytes": 131072, "switchFamily": "macros", "implementedByProxy": false, "implementedByLauncher": false },
-    { "family": "macros", "type": 5, "scope": "character", "format": "Container", "fileName": "data-5-<lo>-<hi>.bin", "maxBytes": 131072, "switchFamily": "macros", "implementedByProxy": false, "implementedByLauncher": false },
-    { "family": "config", "type": 0, "scope": "account", "format": "Container", "fileName": "data-0.bin", "maxBytes": 131072, "switchFamily": "config", "implementedByProxy": false, "implementedByLauncher": false },
-    { "family": "config", "type": 1, "scope": "character", "format": "Container", "fileName": "data-1-<lo>-<hi>.bin", "maxBytes": 131072, "switchFamily": "config", "implementedByProxy": false, "implementedByLauncher": false },
+    { "family": "macros", "type": 4, "scope": "account", "format": "Container", "fileName": "data-4.bin", "maxBytes": 65536, "switchFamily": "macros", "implementedByProxy": true, "implementedByLauncher": true },
+    { "family": "macros", "type": 5, "scope": "character", "format": "Container", "fileName": "data-5-<lo>-<hi>.bin", "maxBytes": 16384, "switchFamily": "macros", "implementedByProxy": true, "implementedByLauncher": true },
+    { "family": "config", "type": 0, "scope": "account", "format": "Container", "fileName": "data-0.bin", "maxBytes": 32768, "switchFamily": "config", "implementedByProxy": true, "implementedByLauncher": true },
+    { "family": "config", "type": 1, "scope": "character", "format": "Container", "fileName": "data-1-<lo>-<hi>.bin", "maxBytes": 32768, "switchFamily": "config", "implementedByProxy": true, "implementedByLauncher": true },
     { "family": "layout", "type": 6, "scope": "character", "format": "Container", "fileName": "data-6-<lo>-<hi>.bin", "maxBytes": 131072, "switchFamily": "layout", "implementedByProxy": false, "implementedByLauncher": false },
-    { "family": "chat", "type": 7, "scope": "character", "format": "Container", "fileName": "data-7-<lo>-<hi>.bin", "maxBytes": 131072, "switchFamily": "chat", "implementedByProxy": false, "implementedByLauncher": false },
+    { "family": "chat", "type": 7, "scope": "character", "format": "Container", "fileName": "data-7-<lo>-<hi>.bin", "maxBytes": 16384, "switchFamily": "chat", "implementedByProxy": true, "implementedByLauncher": true },
     { "family": "tts", "type": 8, "scope": "account", "format": "Container", "fileName": "data-8.bin", "maxBytes": 131072, "switchFamily": "tts", "implementedByProxy": false, "implementedByLauncher": false },
     { "family": "tts", "type": 9, "scope": "character", "format": "Container", "fileName": "data-9-<lo>-<hi>.bin", "maxBytes": 131072, "switchFamily": "tts", "implementedByProxy": false, "implementedByLauncher": false },
     { "family": "flagged", "type": 10, "scope": "account", "format": "Container", "fileName": "data-10.bin", "maxBytes": 131072, "switchFamily": "flagged", "implementedByProxy": false, "implementedByLauncher": false },
     { "family": "flagged", "type": 11, "scope": "character", "format": "Container", "fileName": "data-11-<lo>-<hi>.bin", "maxBytes": 131072, "switchFamily": "flagged", "implementedByProxy": false, "implementedByLauncher": false },
     { "family": "clickbindings", "type": 12, "scope": "character", "format": "Container", "fileName": "data-12-<lo>-<hi>.bin", "maxBytes": 131072, "switchFamily": "clickbindings", "implementedByProxy": false, "implementedByLauncher": false },
-    { "family": "cuf", "type": null, "scope": "account", "format": "RawCuf", "fileName": "cuf.bin", "maxBytes": 131072, "switchFamily": "cuf", "implementedByProxy": false, "implementedByLauncher": false }
+    { "family": "cuf", "type": null, "scope": "account", "format": "RawCuf", "fileName": "cuf.bin", "maxBytes": 2048, "switchFamily": "cuf", "implementedByProxy": true, "implementedByLauncher": true }
   ]
 }

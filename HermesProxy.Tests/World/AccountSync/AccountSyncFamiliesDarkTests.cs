@@ -109,6 +109,21 @@ public class AccountSyncFamiliesDarkTests
         OnlyFamilyUploads("flagged", 10, character: false);
     }
 
+    // ── clickbindings (12 character) ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void ClickbindingsStaysDarkInShippedTable()
+    {
+        Assert.False(AccountSyncDescriptors.ForType(12)!.ImplementedByProxy);
+        Assert.Null(AccountSyncKeys.Build("Elwynn", Guid, 12));
+    }
+
+    [Fact]
+    public void ClickbindingsOnlyCapabilityUploadsOnlyClickbindings()
+    {
+        OnlyFamilyUploads("clickbindings", 12, character: true);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>With the family's switch on and bindings off, only the family's document is uploaded:

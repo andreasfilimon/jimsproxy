@@ -24,18 +24,36 @@ public sealed class AccountSyncJournal
     public Dictionary<string, long> Attempts { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>Reads a valid v1 journal, returning an empty journal for missing or invalid input.</summary>
-    public static AccountSyncJournal Load(string path)
+    public static AccountSyncJournal Load(string path) => Load(path, out _);
+
+    /// <summary>Reads a valid v1 journal and says what it found. The returned journal is the same empty one in
+    /// every failure case, so the decision table stays conservative (a file that differs from the server becomes
+    /// a conflict candidate, never an overwrite); the status lets the caller tell the normal first run
+    /// (<see cref="AccountSyncJournalLoad.Missing"/>) from a journal that was there and could not be used
+    /// (<see cref="AccountSyncJournalLoad.Unreadable"/>, <see cref="AccountSyncJournalLoad.Foreign"/>), which is a
+    /// defect worth a log line and its own conflict reason.</summary>
+    public static AccountSyncJournal Load(string path, out AccountSyncJournalLoad status)
     {
         try
         {
-            if (!File.Exists(path)) return new();
+            if (!File.Exists(path))
+            {
+                status = AccountSyncJournalLoad.Missing;
+                return new();
+            }
             var journal = JsonSerializer.Deserialize<AccountSyncJournal>(File.ReadAllBytes(path), JsonOptions);
-            if (journal is not { Version: 1, Documents: not null }) return new();
+            if (journal is not { Version: 1, Documents: not null })
+            {
+                status = AccountSyncJournalLoad.Foreign;
+                return new();
+            }
             journal.Attempts ??= new(StringComparer.Ordinal);
+            status = AccountSyncJournalLoad.Loaded;
             return journal;
         }
-        catch
+        catch (Exception)
         {
+            status = AccountSyncJournalLoad.Unreadable;
             return new();
         }
     }
@@ -65,6 +83,19 @@ public sealed class AccountSyncJournal
             if (File.Exists(temp)) File.Delete(temp);
         }
     }
+}
+
+/// <summary>What <see cref="AccountSyncJournal.Load(string, out AccountSyncJournalLoad)"/> found on disk.</summary>
+public enum AccountSyncJournalLoad
+{
+    /// <summary>A valid v1 journal was read.</summary>
+    Loaded,
+    /// <summary>There is no journal file: the normal state on the first run of a PC (or after the folder was deleted).</summary>
+    Missing,
+    /// <summary>The file exists but could not be read or parsed (damaged, truncated, locked).</summary>
+    Unreadable,
+    /// <summary>The file parsed but is not a v1 journal (another version or no document table).</summary>
+    Foreign,
 }
 
 /// <summary>A last-confirmed remote revision and content hash.</summary>

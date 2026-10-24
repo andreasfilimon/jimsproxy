@@ -57,13 +57,15 @@ public sealed class AccountSyncClient
         string clientUploadId, CancellationToken cancellationToken) =>
         WriteAsync(HttpMethod.Put, $"documents/{key}", payload, hash, revision, clientUploadId, cancellationToken);
 
-    /// <summary>Posts local content as a conflict candidate.</summary>
+    /// <summary>Posts local content as a conflict candidate. <paramref name="reason"/> says which row of the
+    /// decision table produced it (<see cref="AccountSyncReasons"/>); a server that does not know the field
+    /// ignores it, and a null reason is not sent at all.</summary>
     public Task<AccountSyncWriteResult> PostConflictCandidateAsync(string key, byte[] payload, string hash,
-        string clientUploadId, CancellationToken cancellationToken) =>
-        WriteAsync(HttpMethod.Post, $"documents/{key}/conflict-candidates", payload, hash, null, clientUploadId, cancellationToken);
+        string clientUploadId, string? reason, CancellationToken cancellationToken) =>
+        WriteAsync(HttpMethod.Post, $"documents/{key}/conflict-candidates", payload, hash, null, clientUploadId, cancellationToken, reason);
 
     private async Task<AccountSyncWriteResult> WriteAsync(HttpMethod method, string path, byte[] payload, string hash,
-        string? revision, string clientUploadId, CancellationToken cancellationToken)
+        string? revision, string clientUploadId, CancellationToken cancellationToken, string? reason = null)
     {
         using var timeout = RequestToken(cancellationToken);
         var body = new AccountSyncUpload
@@ -73,6 +75,7 @@ public sealed class AccountSyncClient
             ClientUploadId = clientUploadId,
             DeviceId = _options.DeviceId,
             DeviceLabel = _options.DeviceLabel,
+            Reason = reason,
         };
         using var request = CreateRequest(method, path);
         request.Content = JsonContent.Create(body, options: JsonOptions);
@@ -171,6 +174,11 @@ public class AccountSyncDocumentHead
     public string Revision => ActiveRevision ?? RevisionValue ?? "";
     [JsonPropertyName("sha256")]
     public string Sha256 { get; set; } = "";
+    /// <summary>Hash of the stored document without the container's time field (the same value as
+    /// <see cref="AccountSyncContainer.ContentSha256"/> computes locally). Absent from a server that predates it;
+    /// then every comparison falls back to <see cref="Sha256"/> alone, exactly as before.</summary>
+    [JsonPropertyName("contentSha256")]
+    public string? ContentSha256 { get; set; }
     [JsonPropertyName("byteLength")]
     public int ByteLength { get; set; }
     [JsonPropertyName("state")]
@@ -198,6 +206,10 @@ internal sealed class AccountSyncUpload
     public string DeviceId { get; set; } = "";
     [JsonPropertyName("deviceLabel")]
     public string DeviceLabel { get; set; } = "";
+    /// <summary>Why this upload is a conflict candidate; only set on candidates, omitted when null.</summary>
+    [JsonPropertyName("reason")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Reason { get; set; }
 }
 
 /// <summary>Status and optional head returned by a write.</summary>

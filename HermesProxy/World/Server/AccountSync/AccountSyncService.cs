@@ -35,6 +35,9 @@ public sealed class AccountSyncService : IDisposable
     private int _disabled;
     private int _shutdown;
 
+    /// <summary>Tests only: receives the text of the journal warning (the console log cannot be read back).</summary>
+    internal Action<string>? WarningForTest { get; set; }
+
     internal Action? RestoreTempWrittenForTest { get; set; }
     internal Action? RestoreLockAcquiredForTest { get; set; }
 
@@ -169,7 +172,8 @@ public sealed class AccountSyncService : IDisposable
             var remoteByKey = heads.Where(h => !string.IsNullOrEmpty(h.Key) && !string.IsNullOrEmpty(h.Revision))
                 .ToDictionary(h => h.Key, StringComparer.Ordinal);
             string journalPath = Path.Combine(directory, "sync-journal.json");
-            var journal = AccountSyncJournal.Load(journalPath);
+            var journal = AccountSyncJournal.Load(journalPath, out var journalLoad);
+            ReportJournalLoad(journalPath, journalLoad);
 
             // bindings first, then the rest by lastAttemptAt ascending: a document that ran out of its
             // own sub-budget moves to the back on the next world entry (plan §5 P2.4).
@@ -207,8 +211,13 @@ public sealed class AccountSyncService : IDisposable
                             break;
                         case AccountSyncAction.UploadCreate:
                         case AccountSyncAction.UploadMatch:
-                        case AccountSyncAction.ConflictCandidate:
                             Queue(NewPendingUpload(directory, realmName, guid, descriptor, key, _clock.UtcNow));
+                            break;
+                        case AccountSyncAction.ConflictCandidate:
+                            // The reason is fixed here, from the journal as it was read at world entry: by the time the
+                            // queued upload runs, the first save has already replaced an unreadable journal with a fresh one.
+                            Queue(NewPendingUpload(directory, realmName, guid, descriptor, key, _clock.UtcNow,
+                                AccountSyncDecision.CandidateReason(journalEntry, journalLoad)));
                             break;
                         case AccountSyncAction.ConflictBlocked:
                             Log.Print(LogType.Warn, "account sync: remote document conflict awaits launcher resolution");
@@ -238,6 +247,23 @@ public sealed class AccountSyncService : IDisposable
     private void MarkAttempt(AccountSyncJournal journal, string key)
     {
         journal.Attempts[key] = _clock.UtcNow.ToUnixTimeMilliseconds();
+    }
+
+    /// <summary>Makes a journal that was there but unusable visible. The normal first run has no file and says
+    /// nothing; a damaged or foreign journal is a defect: every document that differs from the server will be offered
+    /// as a conflict candidate (reason <see cref="AccountSyncReasons.JournalUnreadable"/>), and the player sees the
+    /// conflict hint in the launcher. The unusable file is kept next to the journal (one copy, overwritten) so the
+    /// cause can be looked at later; nothing about the account, realm or path goes into the log.</summary>
+    private void ReportJournalLoad(string journalPath, AccountSyncJournalLoad load)
+    {
+        if (load is not (AccountSyncJournalLoad.Unreadable or AccountSyncJournalLoad.Foreign)) return;
+        string message =
+            $"account sync: the sync journal is {(load == AccountSyncJournalLoad.Unreadable ? "unreadable" : "not a v1 journal")}; " +
+            "starting an empty one, documents that differ from the server are offered as conflicts (reason journal-unreadable)";
+        Log.Print(LogType.Warn, message);
+        WarningForTest?.Invoke(message);
+        try { File.Copy(journalPath, journalPath + ".unreadable", overwrite: true); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
     private static void TryPersistJournal(AccountSyncJournal journal, string journalPath, CancellationToken token)
@@ -345,7 +371,8 @@ public sealed class AccountSyncService : IDisposable
             var heads = await _client.ListDocumentsAsync(outerToken) ?? [];
             var remote = heads.FirstOrDefault(h => h.Key == pending.Key && !string.IsNullOrEmpty(h.Revision));
             string journalPath = Path.Combine(pending.Directory, "sync-journal.json");
-            var journal = AccountSyncJournal.Load(journalPath);
+            var journal = AccountSyncJournal.Load(journalPath, out var journalLoad);
+            ReportJournalLoad(journalPath, journalLoad);
             journal.Documents.TryGetValue(pending.Key, out var journalEntry);
             var action = AccountSyncDecision.Decide(hash, journalEntry, remote, mode, contentHash);
 
@@ -359,7 +386,8 @@ public sealed class AccountSyncService : IDisposable
             if (action == AccountSyncAction.ConflictCandidate)
             {
                 var conflictResult = await _client.PostConflictCandidateAsync(
-                    pending.Key, payload, hash, pending.ClientUploadId, outerToken);
+                    pending.Key, payload, hash, pending.ClientUploadId,
+                    pending.Reason ?? AccountSyncDecision.CandidateReason(journalEntry, journalLoad), outerToken);
                 HandleUploadStatus(pending, conflictResult.StatusCode);
                 return;
             }
@@ -374,7 +402,8 @@ public sealed class AccountSyncService : IDisposable
             }
             if (result.StatusCode == HttpStatusCode.Conflict)
             {
-                await HandleUploadConflictAsync(pending, payload, hash, contentHash, journal, journalPath, outerToken);
+                await HandleUploadConflictAsync(pending, payload, hash, contentHash, journal, journalPath,
+                    precondition != null ? AccountSyncReasons.IfMatch : AccountSyncReasons.IfNoneMatch, outerToken);
                 return;
             }
             if (IsTransientStatus(result.StatusCode))
@@ -398,17 +427,18 @@ public sealed class AccountSyncService : IDisposable
     }
 
     private async Task HandleUploadConflictAsync(PendingUpload pending, byte[] payload, string hash, string contentHash,
-        AccountSyncJournal journal, string journalPath, CancellationToken token)
+        AccountSyncJournal journal, string journalPath, string reason, CancellationToken token)
     {
         var heads = await _client.ListDocumentsAsync(token) ?? [];
         var head = heads.FirstOrDefault(h => h.Key == pending.Key && !string.IsNullOrEmpty(h.Revision));
-        if (head != null && string.Equals(head.Sha256, hash, StringComparison.OrdinalIgnoreCase))
+        if (head != null && AccountSyncDecision.SameAsRemote(hash, contentHash, head))
         {
-            Adopt(journal, journalPath, pending.Key, head, hash, contentHash, token);
+            // The journal records the server's own hash: when only the time field differs, that is not the local file's hash.
+            Adopt(journal, journalPath, pending.Key, head, head.Sha256, contentHash, token);
             return;
         }
         var result = await _client.PostConflictCandidateAsync(
-            pending.Key, payload, hash, pending.ClientUploadId, token);
+            pending.Key, payload, hash, pending.ClientUploadId, reason, token);
         HandleUploadStatus(pending, result.StatusCode);
     }
 
@@ -440,8 +470,8 @@ public sealed class AccountSyncService : IDisposable
     }
 
     private static PendingUpload NewPendingUpload(string directory, string realmName, WowGuid128 guid,
-        AccountSyncDescriptor descriptor, string key, DateTimeOffset due) => new(
-        directory, realmName, guid, descriptor, key, due, 0, System.Guid.NewGuid().ToString("D"));
+        AccountSyncDescriptor descriptor, string key, DateTimeOffset due, string? reason = null) => new(
+        directory, realmName, guid, descriptor, key, due, 0, System.Guid.NewGuid().ToString("D"), reason);
 
     /// <summary>The content hash the decision table compares with the journal: without the time field for a
     /// container, the whole file for the raw CUF block (it has no time field).</summary>
@@ -553,5 +583,5 @@ public sealed class AccountSyncService : IDisposable
     }
 
     private sealed record PendingUpload(string Directory, string RealmName, WowGuid128 Guid, AccountSyncDescriptor Descriptor, string Key,
-        DateTimeOffset Due, int RetryAttempt, string ClientUploadId);
+        DateTimeOffset Due, int RetryAttempt, string ClientUploadId, string? Reason = null);
 }

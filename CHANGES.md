@@ -130,6 +130,362 @@ retry/backoff and newer-save replacement, authorization shutdown, both 409 branc
 and fully inert mode.
 See the implementing commit's report for exact focused/full-suite counts and placebo results.
 
+## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
+
+**Issue:** The 1.12 server never tells the proxy how long another unit's buff has left. For a buff first seen already running the proxy filled Duration and Remaining with the spell's full CSV value, recorded that guess as the expiry and served it again later with the Duration flag set, so a 25-minute-old Fortitude showed 30:00 after a relog, a destroy and re-create, or an out-of-range trip (#513). Next to it: a seen recast re-sent the previous application's decayed Remaining instead of the full duration, stack and charge re-emits re-sent the last values undecayed, and the out-of-range leave kept the per-slot duration cache alive so it was read before the durable map.
+
+**Change:** `World/Client/AuraTimerProvenance.cs` (new, pure): every emitted timer is decided by a start class (Self, ObservedGo, ObservedSlot, StatsFirstSeen, StatsRelist, Restored, Unknown) and a duration source (Fixed, Local, Variable, None). A known timer carries the Duration flag with both values on every emit, including stack and charge re-emits, and is recorded with its class; an unknown timer carries no flag and no values and records nothing. `GlobalSessionData.cs`: the expiry map (`UnitAuraExpiry`) holds class-tagged records keyed by the modern spell id and carries the caster; a party member's offline edge marks them and their return shifts every record of theirs by the offline interval (the server pauses an offline member's buffs, measured in the field: 7.0 s after a 7.1 s logout, 18.3 s after 18.4 s), so the watcher's timer and the buff's caster survive the member's relog and the viewer's own buffs stay listed on the raid frame. `World/Client/PacketHandlers/UpdateHandler.cs`: the emit path decides by provenance (local finisher snapshot, warm known cache, fresh in-view application, cold slot served from the map with a 2 s expired-but-present floor, else unknown); a create drops records of spells it does not list (group members and the local player only); the out-of-range leave evicts the per-slot duration state. `World/Client/PacketHandlers/GroupHandler.cs`: out-of-view stats deltas stamp first-seen and relist starts (served for buffs of 50 s or more against a one-second start bound), bulk listings (a full state, a status-flag partial, two or more restates, a partial restating the last full list within 3 s) record nothing, cleared and swapped slots drop their record. `World/Client/PacketHandlers/SpellHandler.cs`: a seen recast restarts the timer at the full duration on the slot whose tracked caster matches the cast's caster; a recast whose duration is not knowable (a talent-modified spell or a finisher cast by someone else) sends no values and clears the record. Breadcrumbs are DebugOutput only except `aura.duration.expired_but_present`, the serve-mode failure signature.
+
+**Verification:** `AuraTimerProvenanceTests`, `PartyDeltaClassificationTests`, `AuraExpiryMapTests` and the adapted `AuraExpiryPersistenceTests`. Field (Kronos PTR, 2026-10-12 and 2026-10-13): a seen recast restarts at full, leave and return keep the real time, both relog directions keep the time and the caster (the shift matched the server's own pause to 54 ms), a buff first seen already running shows no timer, another warrior's Battle Shout shows no timer. Field watch: any timer reaching 0 while the icon stays, any buff first seen running that shows a timer.
+
+## 2026-10-13 — Clear the moving mask from the forced-speed acknowledgement at fear onset (#479, PR #548)
+
+**Issue:** A player-cast fear on a proxied player in PvP left the victim standing still, or stuck in the movement held at the instant control was lost and then snapping back, while a native victim ran. At fear onset the server takes control and raises the victim's run speed; the 1.14 client acknowledges that speed change with a movement block that still carries a transient Falling bit with zero fall time and zero jump speeds plus any held direction or strafe flag, and forwarded as is that acknowledgement pinned the victim's movement state on the server for the length of the fear. Native 1.12 clients answer the same packet with flags 0.
+
+**Change:** `World/Server/FearOnsetAckGate.cs` (new, pure) and `World/Server/PacketHandlers/MovementHandler.cs` (`HandleMoveForceSpeedChangeAck`): when the local player has no control and the acknowledgement has the onset shape (Falling, fall time 0, zero jump speeds), the modern moving mask is cleared before the legacy acknowledgement is written, so it goes out as flags 0 and fall time 0. A real fall (a running fall timer or jump speeds) and any in-control acknowledgement pass untouched. `movement.force_speed_ack.moving_mask_cleared` is DebugOutput only.
+
+**Verification:** `FearOnsetAckGateTests` (8). Field (Kronos PTR, two boxes, warlock on warrior, 2026-10-12): the statue reproduced without the gate in the same hour; with it, fears while standing, strafing either way and mid-jump all fled (a small snap to the ground at a mid-jump onset). Not covered: a victim running forward, a fear right after a knockback, Death Coil.
+
+## 2026-10-13 — Per-member aura slot table, complete out-of-view party buff lists (#513 part C, PR #545)
+
+**Issue:** The 1.12 server reports an out-of-range party member's auras as slot-indexed deltas: a 32-bit positive mask and a 16-bit negative mask, one spell id per set bit, 0 for a cleared slot. The 1.14 party-state aura block has no slot index and no removal marker, and the client replaces the member's stored list with every aura-bearing state, so forwarding each delta as a standalone list shrank the member's buff list on screen to the last change until the next full state (2,038 such partials in 17 captures, median 22 s each), and a SpellId 0 entry for a cleared slot stopped an addon's buff loop early.
+
+**Change:** `World/Client/PartyAuraSlotTable.cs` (new, pure): 48 slots per party member and per party pet (keyed by the member guid, since a pet's guid changes on every summon); a full state rebuilds the table, a partial patches the slots named by the mask bits, and the emitted list is the complete non-zero list in slot order, remapped to modern spell ids (the party path skipped the remap before), with the positive or negative flag by slot and never a SpellId 0 entry. `World/Client/PacketHandlers/GroupHandler.cs`: the four duplicated mask loops use the table; tables are pruned when a group list arrives or a group is destroyed; a pet's table resets on dismissal or a new pet guid. `World/Client/PacketHandlers/UpdateHandler.cs`: a party member or party pet leaving view (destroy or the out-of-range list) primes its table from its last in-view UNIT_FIELD_AURA fields before the field cache is dropped. Auras stays null when no aura bit is set (the #435 rule); a partial with the aura flag and empty masks keeps the list instead of wiping it.
+
+**Verification:** `PartyAuraSlotTableTests` (10). Field (Kronos PTR, 2026-10-12): the out-of-view list stayed complete and shrank only when a buff really expired.
+
+## 2026-10-13 — Scoreboard placement by raid membership, faction counts, in-battleground map fallback (#505, #504, PR #546)
+
+**Issue:** A legacy scoreboard row carries a GUID and scores only, so the proxy fills Sex, Race, Class and Faction of SMSG_PVP_MATCH_STATISTICS from its player cache. On a miss it wrote Male Human Warrior and left the Faction bit false, which the stock frame draws on the Horde side, so early in a match unresolved players sat on the wrong team as Human Warriors, and both faction counts stayed at 0 (#505). After a disconnect and rejoin inside a battleground the queue-slot table was empty and the server does not re-send the status, so IsInBattleground returned false on the battleground map: battleground chat went out as party chat and the raid was filed in group slot 0 (#504). The CMSG_PVP_LOG_DATA throttle, 10 s measured from the last forward, dropped every second request of the stock frame's 5 s refresh.
+
+**Change:** `World/Client/ScoreboardRowResolver.cs` (new, pure): a cache entry with a known race resolves the row and its faction; anything else, including a group-member entry cached with name and class but no race, is placed by raid membership (own team when the guid is self or in either group slot) with a placeholder race that agrees with the placed faction. `World/Client/PacketHandlers/BattleGroundHandler.cs`: both battleground boards use the resolver, fill PlayerCount per faction and send at most 80 rows; a never-seen queue slot ending on a battleground map clears raid slot 1; a slot ending while the character still stands on the map opens the exit window, closed by any status that names a map. `GlobalSessionData.cs` (`DecideInBattleground`, pure): a stored queue entry decides as before (map id on vanilla, battleground id on TBC); without one a battleground map counts, except in the exit window, so the home group the server restores before the teleport out is not filed as the battleground raid. `World/Server/PacketHandlers/BattlegroundHandler.cs`: throttle window 10 s to 4.9 s, which forwards every stock request and caps a misbehaving addon at about 12 per minute. `battleground.scoreboard.row_placeholder` and `battleground.in_bg.map_fallback` are DebugOutput only; `local_faction_unknown` and `rows_capped` stay always-on.
+
+**Verification:** `ScoreboardRowResolverTests` (24) and `BattlegroundStateTests` (13), ten of them red against the old logic. Field (Kronos PTR, 2026-10-12): correct team at first paint with the placeholder race correcting within 5 s, real faction counts, every stock request forwarded, the raid re-filed on three in-battleground relogs. Pre-publish gate for the cut: a normal battleground exit with a home group, by the Leave button and by the end-of-match port-out.
+
+## 2026-10-13 — World Server Down on a fast character switch: pre-auth send guard and stale drainer exit (#388, PR #544)
+
+**Issue:** On a character switch the proxy placed the new WorldClient in the session slot before it connected. The previous character's quest-query drainer, which nothing stopped at logout, kept draining its backlog at about 10 per second through that slot while the TCP connect was still pending. The write failed with NotConnected and the send path's catch marked the whole connect as failed 51 to 97 ms after it started, so the login was aborted with "World Server Down"; the connection itself was healthy and went on to authenticate as an orphan. Corpus: 4 of 4 fast switches that met a live drainer failed, 0 of 516 successful switches had one.
+
+**Change:** `World/Client/WorldClient.cs` (`SendPacket`, under the existing send lock): until the legacy handshake completes only CMSG_AUTH_SESSION may reach the socket, and only that write may decide the connect outcome; any other pre-auth send is dropped with the always-on event `c2s.dropped_before_world_auth` (with the drainer fix it should never fire, so a hit is an unexpected-edge signature). The opcode lookup runs only while the handshake is pending. `World/Server/PacketHandlers/QueryHandler.cs`: after its token wait the drainer checks that its captured GameState is still the session's; if logout replaced it, it clears the stale backlog and exits (`quest.query.bucket_drain_abandoned`, DebugOutput only). The next character re-asks what it needs.
+
+**Verification:** `WorldConnectPreAuthGuardTests` (6, four red on the old code, no network). Field (Kronos PTR, 2026-10-12): four fast switches entered cleanly.
+
+## 2026-10-13 — Hold the cooldown of a stealth-type aura the character logged in with (#550, PR #551)
+
+**Issue:** Stealth, Prowl and Shadowmeld start their cooldown when the aura ends. A native server keeps that cooldown on hold from the cast and lists it in the login spell history with the on-hold flag, so the cooldown event the server sends at the cancel has an entry to start. The 1.12 login cooldown list carries only cooldowns already running, so a character who logged in with one of these auras up had no held entry: the cooldown event at the cancel had nothing to start, the button showed no sweep, and the server refused the recast for the real 10 s with no feedback. Found in the field on 2026-10-12, present on every earlier build.
+
+**Change:** `World/Client/OnHoldCooldownsAtLogin.cs` (new, pure), `World/GameData.cs` (`CooldownStartsOnAuraRemovalSpells`: Stealth R1 to R4, Prowl R1 to R3, Shadowmeld), `World/Client/PacketHandlers/UpdateHandler.cs` (`ArmHeldCooldownsAtSelfCreate`): after the local player's create on a vanilla server, one SMSG_SPELL_COOLDOWN with the on-hold flag and no forced duration for the matching auras the create carries, so the client holds the entry with the spell's own duration until the server's cooldown event starts it. `cooldown.held_armed_at_login` is DebugOutput only.
+
+**Verification:** `OnHoldCooldownsAtLoginTests` (4). Field (2026-10-13): the 10 s sweep shows at once after a stealthed relog.
+
+## 2026-10-13 — Empty state-animation id on every unit and player create (#135, PR #549)
+
+**Issue:** A stealthed character stood upright when idle; the moving sneak was already right (#14 reported the same symptom earlier). A native server writes the build's empty state-animation id on every unit and player create, the same value it writes on game objects. The proxy wrote it for game objects only (the value has been in `VersionChecker` since the 2022 object fix), so every unit and player create left the field at the client default, and the client kept a default standing animation on top of the idle it selects for a stealthed unit. The visibility flag the proxy sends for stealth was never the problem.
+
+**Change:** `World/Server/Packets/UpdatePackets.cs` (`InitializePlaceholders`): UnitData.StateAnimID set to the build's empty id (1672 on 1.14.2, as for game objects) on unit, player and active-player creates when the create does not carry one. `VersionChecker.cs`: `GetGameObjectStateAnimId` renamed `GetEmptyStateAnimId`.
+
+**Verification:** `UnitStateAnimPlaceholderTests` (6, two red without the unit line). Field (Kronos PTR, rogue, 2026-10-12): stock build upright, fix build crouched on the same character in the same minute, still crouched after a step and a stop; emotes, hover, mounted and swimming idles unchanged.
+
+## 2026-10-07 — Pet action bar: opt-in lock for the command and stance buttons (JimsPlus)
+
+**Issue:** a player dropped a pet spell onto the Attack button (or a stance button) and could
+not get it back. The 1.12 server stores the pet bar per pet, but it only honours a
+CMSG_PET_SET_ACTION that writes a *spell*. A write of a command (Attack/Follow/Stay) or
+reaction (Aggressive/Defensive/Passive) button is silently dropped, and the 1.14 client has no
+pet-command spellbook entries to drag, so once a spell displaces one of those six control
+buttons it is gone for good, surviving relog and resummon. Proven with the modern packet
+capture `jimsproxy-20261007-232558`: within one repair, the ability write to an ability slot
+persisted while the Attack and stance writes came back on the next summon still holding the
+spells that had displaced them.
+
+**Change:** the proxy can keep those six slots correct, but only when the player opts in, so a
+deliberate layout (for example a hunter who parks a fifth ability on the Attack slot) is never
+touched. `GameState.PetControlLockEnabled` defaults off; with it off the proxy does nothing to
+any pet bar. JimsPlus 1.2.5 adds a "Lock pet command & stance buttons" checkbox (off by
+default, saved per character) and a "Reset Pet Bar" button, plus `/jp petlock` and
+`/jp petreset`. The checkbox sends the JP `P\tLOCK\t<0|1>` addon sideband (the same channel as
+the zone sync, both ends ours, no secure-frame hooking); JimsPlus re-asserts the saved state on
+every login because the proxy flag is per session. When the lock is on,
+`World/Client/PacketHandlers/PetHandler.cs` forces the control slots to their canonical buttons
+on every forwarded SMSG_PET_SPELLS (`World/PetActionBar.cs` `EnforceControlSlots`: Attack/Follow/
+Stay in 0-2, Aggressive/Defensive/Passive in 7-9, a spell found in one of those rescued into a
+free ability slot, a healthy bar untouched), so a broken pet heals on its next summon, and
+`World/Server/PacketHandlers/PetHandler.cs` refuses a CMSG_PET_SET_ACTION that would drop a
+spell onto a control slot and re-sends the corrected bar. "Reset Pet Bar" / `P\tRESET` repaints
+the current pet at once; turning the lock on does the same immediately. New `ActiveStates` enum
+in `PetDefines.cs`; `GameState.LastPetSpells` snapshot (`PetBarLock`) holds the last forwarded
+bar.
+
+**Verification:** `PetActionBarEnforceTests` (14 cases, including the exact broken bar decoded
+from the capture) cover the enforce and write-allow rules; full suite green. In-game: with the
+lock on, a bar broken earlier was whole again on load and stayed whole across resummon and
+relog, confirmed against the proxy's `pet.bar.control_slots_enforced` / `control_write_blocked`
+events. The drag that displaces a locked button bounces back to a correct bar.
+
+## 2026-10-06 — SMSG_SPELL_EXECUTE_LOG: read Kronos's layout instead of cmangos's
+
+**Issue:** Ten days of logs (2026-09-26 to 10-05) held 303 `guid.legacy.unknown` warnings and 104 `combat.execute_log.parse_failed` errors, every one from `HandleSpellExecuteLog`. The handler assumed the cmangos writer: packed per-target guids, and a guid behind every summon effect. Kronos writes every per-target guid as a plain 8-byte guid (reading it as packed turned Mining, Taunt, Growl, Counterspell and dispel targets into garbage high-guids) and no payload at all for summon-family effects (Dragon's Call 13049 procs ran the reader off the end of the packet 90 times in one evening). Four case labels also carried wrong 1.12 effect ids, so Redemption and Rebirth (113 RESURRECT_NEW) were read as durability damage.
+
+**Change:** `HermesProxy/World/Client/PacketHandlers/SpellHandler.cs`: the per-target decode moved into `ParseSpellExecuteLog` with a per-effect record-size table (1.12 ids from mangos-classic `SpellEffectDefines.h`), raw 8-byte guid reads, no payload for the summon family, and a hard stop on any effect not in the table (one deduplicated `combat.execute_log.unknown_layout` event per spell/effect per session instead of a guess). The try/catch backstop and the `parse_failed` event stay.
+
+**Verification:** `HermesProxy.Tests/World/SpellExecuteLogParseTests.cs` drives the parser with the exact bytes from the 2026-10-05 capture (Mining on Rich Thorium Vein 175404), plus Dragon's Call, Redemption, Counterspell, Fishing, an unknown effect and a truncated record. Field check: mine a node and taunt a mob; the console shows no `[HighGuidLegacy]` warning and no `SpellExecuteLog parse failed` line.
+
+## 2026-10-06 — Translate SMSG_ITEM_TIME_UPDATE so timed items show their countdown
+
+**Issue:** The packet was untranslated (`packet.untranslated` on 2026-09-26, looting a Shadowforge Torch). 1.12 sends it once when a timed item lands in the bags and once per timed item at login; the vmangos sender carries the comment that the client needs it to display the remaining time even though the duration field is set. The 1.14 client uses the same packet for the same job. Every timed quest item in Classic (161 of them: Shadowforge Torch, Fresh Carcass, the Un'Goro samples, the Alterac Assault Orders, the Hallow's End masks) showed no countdown and vanished without warning.
+
+**Change:** `HermesProxy/World/Server/Packets/ItemPackets.cs` adds the modern `ItemTimeUpdate` (packed guid, seconds; Realm connection as native). `HermesProxy/World/Client/PacketHandlers/ItemHandler.cs` adds the handler and `ParseItemTimeUpdate`; a copy that arrives before the item's create (the login copies on Kronos) is stashed and re-emitted after the create, the same rule as the #503 enchant-time stash, because the client drops a time update for a guid it has not built.
+
+**Verification:** `HermesProxy.Tests/World/ItemTimeUpdateTests.cs`. Field: carry any timed quest item through a relog; the tooltip shows the remaining time and counts down.
+
+## 2026-10-06 — Translate the three untranslated 1.12 combat-log packets
+
+**Issue:** `packet.untranslated` over ten days of logs: SMSG_PROC_RESIST 64, SMSG_SPELL_OR_DAMAGE_IMMUNE 12, SMSG_SPELL_MISS_LOG 7. The cases a cast's own SMSG_SPELL_GO covers (miss, resist, immune on the cast itself) already reach the client; these three are the ones with no cast behind them. On 1.12 a periodic tick or damage shield that fully resists shows a "Resist" float and one that lands on an immune target shows "Immune" (vmangos SpellAuras periodic handlers, Unit::TriggerDamageShields); on ours the tick looked like it silently skipped. SMSG_PROC_RESIST is a proc that resisted after a melee or ranged hit and only feeds the combat log tab (Kronos sends it; cmangos defines the writer but never calls it).
+
+**Change:** `HermesProxy/World/Server/Packets/SpellPackets.cs` adds `SpellMissLog`, `ProcResist` and `SpellOrDamageImmune` (WowPacketParser V6 CombatLogHandler layouts, shared by the 1.14 and 2.5 tables; connections as native). `HermesProxy/World/Client/PacketHandlers/SpellHandler.cs` adds the three handlers and their `Parse*` functions (cmangos Unit.cpp writers; the sizes match the Kronos captures).
+
+**Verification:** `HermesProxy.Tests/World/CombatLogPacketTests.cs`. Field: a DoT ticking on a bubbled paladin shows "Immune"; the combat log tab shows resisted procs after a few minutes of melee.
+
+## 2026-10-02 — Quick-start installer 1.1.2: review fixes, yes/no menus, console look
+
+**Issue:** a code review of the installer found, among others: Update, Reconfigure and Uninstall
+acted on the folder recorded in `quickstart.json`, so uninstalling a copied installation (a
+common way to multibox) removed the original's `Hermes`, addon and portal line; `-Uninstall` on
+an unfinished installation installed instead; OneDrive marks every synced folder as a reparse
+point, so Update and Uninstall failed there and the scan skipped OneDrive folders; the window
+closed at once after a successful Update, Reconfigure or Uninstall; a menu taller than the window
+(or a window shrunk during a menu) crashed in Windows Terminal; an empty `latest.json` crashed
+instead of falling back; keys pressed while busy answered the next menu; an in-place install
+interrupted after the rename made a second backup on the next run; Uninstall and Reconfigure
+needed the internet; `-CopyTo` and `-ExtractTo` could not be resumed; a client under Program
+Files failed late with an unexpected error. Separately, the yes/no questions were still typed
+`[Y/n]` prompts and the console output was plain text.
+
+**Change (review fixes):** `scripts/quickstart/install.ps1`, `Install JimsProxy.cmd`:
+- `Get-State` re-bases a copied or moved `quickstart.json` onto the folder it was read from
+  (and drops the original's shortcut), so maintenance acts only on the selected copy. A state
+  whose recorded paths lie outside its own folder is not used. Drive roots stay `X:\`, so
+  `-Root C:\` acts on `C:\`.
+- `-Update` and `-Reconfigure` act only on a finished installation (exit 3 otherwise);
+  `-Uninstall` also removes an unfinished one; no action switch falls through to installing;
+  action switches cannot be combined with `-ClientArchive`, `-ExtractTo` or `-CopyTo`.
+- Links are recognised by link type (junction or symbolic link), not by the reparse-point
+  attribute; `Remove-Tree` deletes bottom-up; the scan descends into OneDrive folders.
+- The installer waits for a key at the end of every interactive run started from the `.cmd`
+  (success, failure, `Q` or Ctrl+C) and leaves a marker file for the `.cmd`; without the marker
+  (a script blocked by policy or antivirus, or damaged) the `.cmd` pauses after a failure itself.
+- Menus that do not fit the window, or whose window shrinks, use numbered choices; so do
+  windows narrower than 50 columns. The progress bar needs 72 columns and the summary frame 60;
+  narrower windows get plain lines.
+- An empty, `null` or `{}` `latest.json` is treated as unreadable (warning, fallback).
+- Keys typed while the installer is busy are discarded before each menu (numbered ones too) and
+  the welcome prompt.
+- In-place: the state (with the backup's path) is saved before `AccountData` is copied; a copy
+  interrupted before it finished is repeated on resume, a finished one never (changes made since
+  are kept). Uninstall names the `Hermes-backup-<date>` it keeps (recorded from 1.1.2 on).
+- Step 1 only warns about an unreachable host; installing checks again before the first copy,
+  extraction or download.
+- A folder that `-CopyTo` or `-ExtractTo` (or the menu) already filled is continued on the next
+  run instead of refused.
+- A root that cannot be written offers the copy route (or `-CopyTo`); destinations are checked
+  for write access the way the installer writes (a new folder, then a file in it), so a standard
+  user's `C:\Games\Kronos` is accepted. A destination on a drive that does not exist is reported
+  as such.
+- Interactive `-ClientDir` on a client with a `Hermes` the installer did not create offers the
+  copy / in-place menu (1.1.1 stopped with exit 3); its last choice is Quit, and declining the
+  in-place install returns to that menu.
+- The scan does not open online-only cloud files (opening one would download it).
+- The copy route waits until the game is closed (Retry / Quit; `-Yes` stops with exit 2), and a
+  file that still cannot be copied stops with one instruction naming it, instead of the generic
+  "run again" advice contradicting "delete the incomplete folder".
+- A copy destination inside the client being copied is refused.
+- The desktop shortcut is `Play Kronos.lnk` unless that name already belongs to another
+  installation; then it is `Play Kronos (<installation folder>).lnk`. Uninstall deletes the
+  shortcut only if it still starts that installation.
+
+**Change (look and menus):** `scripts/quickstart/install.ps1` (1.1.2):
+- `Read-YesNo` shows a Yes / No menu with the default highlighted when it runs in a console;
+  redirected input keeps the typed `[Y/n]` answer and `-Yes` still accepts the defaults.
+- Menus at the bottom of the window no longer draw one line low (which left a blank line under
+  the question and overwrote the key hint): the menu position is measured after the hint line,
+  which scrolls the window.
+- Console look: title and subtitle, step headings as a dim counter and a cyan name over a thin
+  rule, a green checkmark on each passed check, warnings in yellow, the failure block in red
+  with its Next line in white, a `►` menu cursor, a progress bar that updates in place while a
+  client is copied or extracted, and the final summary in a green frame (long paths shortened
+  to fit). The log file stays plain text and keeps the progress milestones; redirected output
+  stays plain lines.
+
+`docs/QUICK-INSTALL.md`: Step 5 and Step 6 show the menus; menu examples use the `►` cursor; the
+review fixes (window stays open, offline Uninstall and Reconfigure, copies, resumable
+destinations, action-switch rules, exit codes).
+
+**Verification:** scripted suites of 82 checks, all passing: a copied installation updated and
+uninstalled while the original's `Hermes`, addon and portal line stayed intact; action switches
+refused or uninstalling (never installing); junctions vs. OneDrive folders; `Remove-Tree` on a
+tree with a read-only file and a junction; an empty manifest; in-place resume (one backup,
+`AccountData` changed after the copy kept, an interrupted copy repeated, a copied installation
+reporting its own backup at uninstall); offline Uninstall, offline install, and offline
+`-CopyTo` / `-ExtractTo` stopping before any copy; `-CopyTo` and `-ExtractTo`
+resumed by the same command; a read-only root refused, then installed via `-CopyTo`; a running
+game blocks the copy (exit 2 unattended; Retry continues once it is closed); a copy destination
+inside the source refused; a second installation's shortcut gets its own name, and uninstalling
+leaves a shortcut that now starts another installation; a destination under `C:\` as a standard
+user; an installation at a drive root (a `subst` drive) with its own shortcut name, uninstalled
+with `-Root X:\` from inside another installation, which stayed intact; a state pointing at
+another client refused; a missing drive; the `.cmd` pausing when the script cannot run, and not
+pausing twice or after a failed `-Yes` run; a state recorded with a short (8.3) folder name
+re-based onto its copy. The drive-root, `C:\` and outside-state checks were also run without these fixes
+and failed there. In Windows
+Terminal, driven by keypresses (screenshots checked): the window waiting after a successful
+Update; Ctrl+C during an extraction keeping its messages on screen; Esc pressed twice during
+Keep searching; a full install with the new look, the progress bar, the framed summary, a failure
+block, the yes/no menus. In the classic console: a menu taller than the window and a window
+shrunk during a menu both fall back to numbered choices; a 45-column window gets numbered menus,
+no progress bar and no frame; the `-ClientDir` menu ends with Quit and returns to itself after a
+declined in-place install. Redirected and `-Yes` runs unchanged.
+
+## 2026-10-01 — Quick-start installer 1.1.1: Kronos login mirrors; guide corrections
+
+**Issue:** `login2.twinstar-wow.com` and `login3.twinstar-wow.com` are mirrors of
+`login.twinstar-wow.com` that reach the same realms, but the installer and the guides labelled them
+"Kronos 2" and "Kronos 3", which reads as separate realms. The quick-start guide also named only
+`Hermes\install.log` as the log, although the installer logs to `%TEMP%` until `Hermes` exists, and
+said nothing about when a server change takes effect.
+
+**Change:** `scripts/quickstart/install.ps1` (1.1.1): server menu names `Kronos mirror 2` and
+`Kronos mirror 3`, as in the launcher; the `-Server` keys `kronos2` and `kronos3` are unchanged, so
+existing `quickstart.json` files keep working; the `-Server` error and the header describe the
+mirrors and when the installer copies or extracts a client. `docs/QUICK-INSTALL.md`: mirror labels
+in the server menu and the `-Server` row, both log locations, when a server change takes effect.
+`docs/MANUAL-INSTALL.md`: mirror labels and when to use one. `docs/configuration.md`: `ServerAddress`
+lists the mirrors as mirrors.
+
+**Verification:** server menu shows the mirror labels; `-Server kronos2` selects
+`login2.twinstar-wow.com`; installations made with installers 1.0.0 and 1.1.0 on `kronos2` update
+and reconfigure under 1.1.1 with the server kept.
+
+## 2026-09-27 — Quick-start installer 1.1.0: client list, existing installations, welcome screen
+
+**Issue:** first hands-on test of the installer. Clients that already had a launcher or manual
+`Hermes` were listed as choices and then refused, so a valid client could not be used at all;
+long paths wrapped and the list mixed usable clients with unusable ones; the typed-path option
+added nothing over Browse; the installer started without saying what it would do.
+
+**Change:** `scripts/quickstart/install.ps1`, `scripts/quickstart/README.txt`, `docs/QUICK-INSTALL.md`.
+- Welcome screen before Step 1: what the installer does, the guide link, Enter to continue
+  (skipped with `-Yes`). The welcome screen and `README.txt` link the jimothy.cc quick-start
+  guide.
+- Every menu uses arrow keys and Enter (numbered choices when input is redirected). The client
+  list shows a green `√` per usable client with its folder name and a shortened path, notes
+  clients that already have a `Hermes`, counts unusable clients on one dim line, and puts
+  Browse, Extract a client archive, Keep searching and Quit after a blank line. The typed-path
+  options are removed. Temporary folders are not scanned.
+- Keep searching walks every folder on every fixed drive, with a folder counter; Esc stops it.
+- Only 1.15 clients found: the installer recommends the Classic WoW Launcher, which can copy and
+  patch a 1.15 client.
+- A client with an existing `Hermes`: copy the client (showing the extra disk space) into a new
+  folder and install there, or install in place after a warning, renaming the old `Hermes` to
+  `Hermes-backup-<date>` at Step 4 and carrying its `AccountData` over. `-CopyTo` does the copy
+  unattended.
+
+**Verification:** Windows 11, PowerShell 5.1, local copies of the published archives. The
+arrow-key list driven by keypresses in Windows Terminal (screenshot checked) through a full
+install; the numbered fallback; copy route unattended (8.1 GB, original byte-identical, `Data`
+junction copied as real files) and in-place route interactive (No returns to the list, Yes
+renames at Step 4, `AccountData` carried over); Keep searching (246,373 folders in 85 s, found a
+client six levels deep); only-1.15 recommendation; unattended install, reconfigure, update and
+uninstall unchanged.
+
+## 2026-09-23 — Release workflow: attach JimsProxy-QuickStart.zip to every release
+
+**Issue:** the quick-start guide and jimothy.cc link to
+`releases/latest/download/JimsProxy-QuickStart.zip`, which resolves only against the newest full
+release. A release without the asset breaks that link.
+
+**Change:** `.github/workflows/Release.yml`: the Windows build job runs
+`scripts/build-quickstart.ps1` under Windows PowerShell 5.1 and uploads
+`build/JimsProxy-QuickStart.zip` as an artifact; the release job already attaches every artifact
+zip and lists it in `checksums-sha256.txt`. The verify job fails the release if the zip is missing
+or lacks `Install JimsProxy.cmd`, `install.ps1`, `README.txt`, or `VERSION.txt` at its root. The
+build step fails if `scripts/build-quickstart.ps1` is absent (it arrives with PR #532).
+
+**Verification:** workflow YAML parsed with js-yaml; the verify check run locally against a zip
+built by `scripts/build-quickstart.ps1`. First real run is the next release.
+
+## 2026-09-22 — Quick-start bundle: installer script and build script
+
+**Issue:** `docs/QUICK-INSTALL.md` described a one-click installer that did not exist yet, so
+the only route without the launcher was the five manual steps of `docs/MANUAL-INSTALL.md`.
+
+**Change:** scripts and docs only; no proxy code touched.
+- `scripts/quickstart/`: the bundle sources. `Install JimsProxy.cmd` is the entry point and
+  stops with "Extract the zip first" when opened from inside the zip; `install.ps1` is the
+  six-step installer plus update, reconfigure, and uninstall; `README.txt`.
+- `install.ps1` checks the client build (1.14.2.42597 only, from `.build.info` or the
+  executable's version, also inside a client archive before any extraction), downloads the
+  proxy archive named by `jimothy.cc/proxy/<channel>/latest.json` and verifies its published
+  SHA-256, checks the archive's contents before creating `Hermes`, keeps `HermesProxy.config`
+  and `AccountData` on update, and refuses a root folder whose `Hermes` it did not create
+  (a launcher or manual installation). Client archives are identified by their contents, never
+  by file name: the scan opens each zip larger than 1 GB and accepts it if it holds
+  `.build.info` and `_classic_era_/WowClassic_ForCustomServers.exe` (entry names compared with
+  forward slashes). Windows PowerShell 5.1, ASCII only, no administrator rights.
+- `scripts/build-quickstart.ps1`: packs the bundle into `build/JimsProxy-QuickStart.zip`
+  (files at the zip root) with a generated `VERSION.txt`, refuses non-ASCII `.ps1`/`.cmd`
+  files, and prints the zip's SHA-256.
+- `scripts/play.ps1`: parameters reduced to `-ProxyDir` and `-GameExe`; the portal line is
+  always set, the proxy always stopped, and the ready wait fixed at 60 seconds. The wait for a
+  WoW process started by a wrapper is removed (it also waited on any other running client).
+- `docs/QUICK-INSTALL.md`: menus, prompts, parameters and exit codes corrected against
+  `install.ps1`.
+
+**Verification:** on Windows 11 with PowerShell 5.1, against a local server serving the
+published 5.2.0 and 5.2.1-beta.4 archives (SHA-256 identical to `latest.json`) and a copy of a
+1.14.2.42597 client. `play.ps1`: `play.bat -GameExe` reset a changed portal line, reached the
+Kronos realm list, and on game exit stopped the proxy through the stdin handshake; a killed
+game and Ctrl+C in the Play window also stopped it through the handshake. Installer:
+unattended install; update 5.2.0 to 5.2.1-beta.4 left `HermesProxy.config` and `AccountData`
+byte-identical and was refused while the proxy ran; reconfigure; interactive and unattended
+uninstall. Archives: the scan listed an 8.1 GB client archive and a wrong-build one (not
+selectable) by contents and skipped a 1.1 GB non-client zip; the client archive was extracted,
+installed and played to the realm list; wrong-build, non-client and unreadable archives were
+rejected before extraction; an archive with backslash entry names inside a prefix folder
+installed unattended; non-empty and too-small destinations refused; Ctrl+C during extraction
+(exit 6, incomplete-folder message, re-run refused). Also: no network (exit 2); an error page
+in place of the proxy archive (exit 5, no `Hermes` left); a failed run resumed on the next run.
+Not yet run against the live jimothy.cc.
+
+## 2026-09-22 — Installation guides, configuration reference, and play scripts
+
+**Issue:** the README offered only the launcher. Running the proxy by hand had no documentation
+beyond `dotnet publish` (#492 and #495 were reverted for placement, not content), there was no
+manual equivalent of the launcher's Play sequence, and `verify-checksums.*` pointed at
+`Xian55/HermesProxy`.
+
+**Change:** docs and scripts only; no proxy code.
+- `README.md`: an Installation section with three routes (the launcher at jimothy.cc/install,
+  the quick-start bundle, manual install) and a current feature list.
+- `docs/MANUAL-INSTALL.md`: install and run without the launcher on Windows, with the exact
+  PowerShell commands; Linux and macOS appendix (community-supported, built from source);
+  troubleshooting; reference.
+- `docs/QUICK-INSTALL.md`: the quick-start bundle's installer, prompts, parameters and exit codes.
+- `docs/configuration.md`: all 40 keys the proxy reads (restores #495).
+- `scripts/play.ps1` + `play.bat` (Windows) and `scripts/play.sh` (Linux, macOS): port check,
+  portal line, start the proxy, wait for `Starting WorldSocket service`, start the game, then stop
+  the proxy through the stdin shutdown handshake so the JSONL log is flushed.
+- `scripts/verify-checksums.*`: repository corrected to `jameopotato/jimsproxy`.
+
+**Verification:** configuration keys checked against `Settings.cs` (40/40) and the shipped
+`HermesProxy.config` (19/19). Download facts (file name, archive layout, `latest.json` hash,
+TLS 1.2, progress-bar cost) confirmed against jimothy.cc from Windows PowerShell 5.1. `play.sh`
+run on Linux against a stand-in proxy that mirrors the real startup lines and shutdown
+handshake: normal session, port in use, startup failure, detached game command, missing config,
+SIGTERM, Ctrl+C. `play.ps1` is verified on Windows in the quick-start bundle entry. Relative
+links and anchors checked.
+
+---
+
 ## 2026-09-18 — SMSG_FEATURE_SYSTEM_STATUS: leave the RaceClassExpansionLevels list absent instead of sending an empty one (Linux client crash at world entry)
 
 **Issue:** a player on Linux reported the 1.14.2 client crashing at world entry on the proxy, 6 of 6

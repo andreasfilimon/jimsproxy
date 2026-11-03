@@ -5,6 +5,7 @@ using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
+using System.Collections.Generic;
 
 namespace HermesProxy.World.Client;
 
@@ -19,6 +20,31 @@ public partial class WorldClient
         for (int i = 0; i < len; i++)
             sb.Append(data[i].ToString("X2"));
         return sb.ToString();
+    }
+
+    // JimsProxy (2026-11-03): the cooldown block at the end of SMSG_PET_SPELLS_MESSAGE. Before 3.1 an
+    // entry is [spell u16][category u16][cooldown u32][category cooldown u32] = 12 bytes: vMaNGOS since
+    // 5fe4f0a7b (2026-11-02), cmangos-classic, and this parser's original form (d7a6a32). f672fb2 read
+    // 8 bytes (no category cooldown) for every pre-3.1 server to absorb a Twinstar/Kronos shape, which
+    // shifted every entry after the first on a 12-byte server. The entry size now follows the bytes
+    // the server actually sent; 3.1+ keeps its u32 spell id and category cooldown.
+    internal static List<PetSpellCooldown> ReadLegacyPetSpellCooldowns(WorldPacket packet)
+    {
+        byte cdCount = packet.ReadUInt8();
+        var cooldowns = new List<PetSpellCooldown>(cdCount);
+        bool wideSpellId = LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_0_9767);
+        bool categoryDuration = wideSpellId || packet.BytesRemaining >= cdCount * 12;
+        for (int i = 0; i < cdCount; i++)
+        {
+            PetSpellCooldown cooldown = new();
+            cooldown.SpellID = wideSpellId ? packet.ReadUInt32() : packet.ReadUInt16();
+            cooldown.Category = packet.ReadUInt16();
+            cooldown.Duration = packet.ReadUInt32();
+            if (categoryDuration)
+                cooldown.CategoryDuration = packet.ReadUInt32();
+            cooldowns.Add(cooldown);
+        }
+        return cooldowns;
     }
 
     [PacketHandler(Opcode.SMSG_PET_SPELLS_MESSAGE)]
@@ -126,23 +152,7 @@ public partial class WorldClient
             for (int i = 0; i < spellCount; i++)
                 spells.Actions.Add(packet.ReadUInt32());
 
-            byte cdCount = packet.ReadUInt8();
-            for (int i = 0; i < cdCount; i++)
-            {
-                PetSpellCooldown cooldown = new();
-
-                if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_0_9767))
-                    cooldown.SpellID = packet.ReadUInt32();
-                else
-                    cooldown.SpellID = packet.ReadUInt16();
-
-                cooldown.Category = packet.ReadUInt16();
-                cooldown.Duration = packet.ReadUInt32();
-                if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_0_9767))
-                    cooldown.CategoryDuration = packet.ReadUInt32();
-
-                spells.Cooldowns.Add(cooldown);
-            }
+            spells.Cooldowns.AddRange(ReadLegacyPetSpellCooldowns(packet));
 
             Log.Event("pet.spells.parsed", new
             {
@@ -153,7 +163,7 @@ public partial class WorldClient
                 command_state = spells.CommandState.ToString(),
                 flag = spells.Flag,
                 spell_count = spellCount,
-                cd_count = cdCount,
+                cd_count = spells.Cooldowns.Count,
                 packet_size = dbgPacketSize,
             });
 

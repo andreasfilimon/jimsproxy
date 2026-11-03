@@ -5,6 +5,7 @@ using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 
 namespace HermesProxy.World.Client;
@@ -22,27 +23,101 @@ public partial class WorldClient
         return sb.ToString();
     }
 
-    // JimsProxy (2026-11-03): the cooldown block at the end of SMSG_PET_SPELLS_MESSAGE. Before 3.1 an
-    // entry is [spell u16][category u16][cooldown u32][category cooldown u32] = 12 bytes: vMaNGOS since
-    // 5fe4f0a7b (2026-11-02), cmangos-classic, and this parser's original form (d7a6a32). f672fb2 read
-    // 8 bytes (no category cooldown) for every pre-3.1 server to absorb a Twinstar/Kronos shape, which
-    // shifted every entry after the first on a 12-byte server. The entry size now follows the bytes
-    // the server actually sent; 3.1+ keeps its u32 spell id and category cooldown.
+    // JimsProxy (2026-11-03): the cooldown block that ends SMSG_PET_SPELLS_MESSAGE. 3.1+ servers send
+    // [count u8] + [spell u32][category u16][cooldown u32][category cooldown u32] per entry.
     internal static List<PetSpellCooldown> ReadLegacyPetSpellCooldowns(WorldPacket packet)
     {
+        if (!LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_0_9767))
+        {
+            var cooldownsPre31 = ParsePreWotlkPetCooldowns(packet.ReadBytes((uint)packet.BytesRemaining), out var layout);
+            if (layout == PreWotlkPetCooldownLayout.Unrecognized)
+                Log.Event("pet.cooldowns.unrecognized_layout", new { cd_count = cooldownsPre31.Count });
+            return cooldownsPre31;
+        }
+
         byte cdCount = packet.ReadUInt8();
         var cooldowns = new List<PetSpellCooldown>(cdCount);
-        bool wideSpellId = LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_0_9767);
-        bool categoryDuration = wideSpellId || packet.BytesRemaining >= cdCount * 12;
         for (int i = 0; i < cdCount; i++)
         {
             PetSpellCooldown cooldown = new();
-            cooldown.SpellID = wideSpellId ? packet.ReadUInt32() : packet.ReadUInt16();
+            cooldown.SpellID = packet.ReadUInt32();
             cooldown.Category = packet.ReadUInt16();
             cooldown.Duration = packet.ReadUInt32();
-            if (categoryDuration)
-                cooldown.CategoryDuration = packet.ReadUInt32();
+            cooldown.CategoryDuration = packet.ReadUInt32();
             cooldowns.Add(cooldown);
+        }
+        return cooldowns;
+    }
+
+    internal enum PreWotlkPetCooldownLayout { TwelveByte, EightByte, VmangosLegacy, Unrecognized }
+
+    // Pre-3.1 servers disagree on the cooldown block, and nothing follows it, so its exact length
+    // names the shape:
+    //   1 + 12n  [count u8]  [spell u16][category u16][cooldown u32][category cooldown u32]
+    //            (vMaNGOS since 5fe4f0a7b, cmangos-classic, this parser's original form d7a6a32)
+    //   1 + 8n   [count u8]  [spell u16][category u16][cooldown u32]  (Twinstar/Kronos, f672fb2)
+    //   2 + 14m  [count u16] [spell u32][category u16][cooldown u32][category cooldown u32]
+    //            (vMaNGOS before 5fe4f0a7b, i.e. a core rolled back past that commit)
+    // The three never collide: 12n and 8n differ for n > 0, and 2 + 14m is even where 1 + 12n and
+    // 1 + 8n are odd. Any other length keeps the pre-2026-11-03 reading (8-byte entries after a u8
+    // count, trailing bytes ignored); a block too short for that still throws, which the handler's
+    // wrapper turns into a dropped pet bar as before.
+    internal static List<PetSpellCooldown> ParsePreWotlkPetCooldowns(ReadOnlySpan<byte> block, out PreWotlkPetCooldownLayout layout)
+    {
+        var cooldowns = new List<PetSpellCooldown>();
+        if (block.Length == 0)
+            throw new ArgumentOutOfRangeException(nameof(block), "SMSG_PET_SPELLS_MESSAGE ends before the cooldown count");
+
+        int n = block[0];
+        int rest = block.Length - 1;
+        if (rest == n * 12)
+        {
+            layout = PreWotlkPetCooldownLayout.TwelveByte;
+            for (int i = 0; i < n; i++)
+            {
+                var e = block.Slice(1 + i * 12, 12);
+                cooldowns.Add(new PetSpellCooldown
+                {
+                    SpellID = BinaryPrimitives.ReadUInt16LittleEndian(e),
+                    Category = BinaryPrimitives.ReadUInt16LittleEndian(e[2..]),
+                    Duration = BinaryPrimitives.ReadUInt32LittleEndian(e[4..]),
+                    CategoryDuration = BinaryPrimitives.ReadUInt32LittleEndian(e[8..]),
+                });
+            }
+            return cooldowns;
+        }
+
+        if (block.Length >= 2)
+        {
+            int m = BinaryPrimitives.ReadUInt16LittleEndian(block);
+            if (block.Length - 2 == m * 14)
+            {
+                layout = PreWotlkPetCooldownLayout.VmangosLegacy;
+                for (int i = 0; i < m; i++)
+                {
+                    var e = block.Slice(2 + i * 14, 14);
+                    cooldowns.Add(new PetSpellCooldown
+                    {
+                        SpellID = BinaryPrimitives.ReadUInt32LittleEndian(e),
+                        Category = BinaryPrimitives.ReadUInt16LittleEndian(e[4..]),
+                        Duration = BinaryPrimitives.ReadUInt32LittleEndian(e[6..]),
+                        CategoryDuration = BinaryPrimitives.ReadUInt32LittleEndian(e[10..]),
+                    });
+                }
+                return cooldowns;
+            }
+        }
+
+        layout = rest == n * 8 ? PreWotlkPetCooldownLayout.EightByte : PreWotlkPetCooldownLayout.Unrecognized;
+        for (int i = 0; i < n; i++)
+        {
+            var e = block.Slice(1 + i * 8, 8);
+            cooldowns.Add(new PetSpellCooldown
+            {
+                SpellID = BinaryPrimitives.ReadUInt16LittleEndian(e),
+                Category = BinaryPrimitives.ReadUInt16LittleEndian(e[2..]),
+                Duration = BinaryPrimitives.ReadUInt32LittleEndian(e[4..]),
+            });
         }
         return cooldowns;
     }

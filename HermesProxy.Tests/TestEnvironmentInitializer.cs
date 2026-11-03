@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using HermesProxy.Enums;
 
@@ -22,5 +23,16 @@ internal static class TestEnvironmentInitializer
             global::Framework.Settings.ClientBuild = ClientVersionBuild.V1_14_2_42597;
         if (global::Framework.Settings.ServerBuild == ClientVersionBuild.Zero)
             global::Framework.Settings.ServerBuild = ClientVersionBuild.V1_12_1_5875;
+    }
+
+    // JimsProxy (2026-11-03): the proxy pins InvariantCulture in Program.Main before any
+    // CSV is parsed (GameData uses culture-sensitive float.Parse). The test host never runs
+    // Main, so on a machine with a comma-decimal locale (de_DE) GameData.LoadCreatureDisplayInfo
+    // threw on "0.4" and turned CollisionHeightTests red (12 tests). Mirror Main here.
+    [ModuleInitializer]
+    internal static void PinInvariantCulture()
+    {
+        CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
+        CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
     }
 }
